@@ -1,0 +1,48 @@
+{
+  "name": "pi-relay",
+  "version": "0.0.0",
+  "private": true,
+  "description": "pi extension: join cross-machine pi sessions via a WebSocket relay.",
+  "license": "MIT",
+  "type": "module",
+  "main": "index.ts",
+  "files": [
+    "index.ts",
+    "types.ts",
+    "config.ts",
+    "relay-client.ts",
+    "reply-tracker.ts",
+    "ui/**/*.ts",
+    "skills/**/*"
+  ],
+  "keywords": [
+    "pi-package"
+  ],
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ],
+    "skills": [
+      "./skills"
+    ]
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.74.0",
+    "@earendil-works/pi-tui": "^0.74.0"
+  },
+  "dependencies": {
+    "@pi-relay/shared": "*",
+    "ws": "^8.18.0",
+    "typebox": "^1.1.24"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.74.0",
+    "@earendil-works/pi-tui": "^0.74.0",
+    "@types/node": "^22.0.0",
+    "@types/ws": "^8.5.10",
+    "typescript": "^5.5.0"
+  }
+}
