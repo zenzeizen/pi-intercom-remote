@@ -28,6 +28,10 @@ Use **send** when you're sharing information or status without needing a reply:
 - "FYI: lockfile is stale, regenerating."
 - "Heads up: I'm about to restart the dev server."
 
+## Identifying peers
+
+Always call `intercom_list` first to get session ids of peers in the room. Names may collide (two pi sessions on the same machine often share a hostname-based default name), but session ids (uuids) are always unique. Pass the full session-id `id:` field from `intercom_list` as the `to` parameter when calling `intercom_send`, `intercom_ask`, or `intercom_reply`. A unique 6+ character id prefix also works as a shortcut.
+
 ## Joining a room
 
 If the user hasn't joined a room yet, suggest:

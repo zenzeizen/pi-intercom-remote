@@ -15,7 +15,11 @@ import { normalizeRoomCode } from "./codes.js";
 
 /**
  * Per-connection state and message handler. One Connection wraps one
- * WebSocket. State machine is trivial: AWAITING_HELLO → READY → CLOSED.
+ * WebSocket. State machine: AWAITING_HELLO → READY → CLOSED.
+ *
+ * The relay does not interpret peer.send payload semantics (ask vs reply vs
+ * plain message) — that's a client-side concern carried in the PeerMessage
+ * fields. Relay just routes envelopes.
  */
 type ConnState = "awaiting_hello" | "ready" | "closed";
 
@@ -77,13 +81,10 @@ export class Connection {
         this.handleRoomLeave();
         return;
       case "peer.send":
-        this.handlePeerSend(msg.to, msg.body);
+        this.handlePeerSend(msg.to, msg.message);
         return;
-      case "peer.ask":
-        this.handlePeerAsk(msg.to, msg.requestId, msg.body);
-        return;
-      case "peer.reply":
-        this.handlePeerReply(msg.to, msg.requestId, msg.body);
+      case "presence.update":
+        this.handlePresenceUpdate(msg.info);
         return;
       case "ping":
         this.send({ type: "pong", ts: msg.ts });
@@ -140,7 +141,6 @@ export class Connection {
     this.rooms.addToRoom(room, this);
     const peers = this.rooms.peerInfos(room);
     this.send({ type: "room.joined", code: room.code, peers });
-    // Notify everyone else in the room.
     for (const member of room.members.values()) {
       if (member.sessionId === this.sessionId) continue;
       member.send({ type: "room.peer-joined", peer: this.info });
@@ -164,57 +164,44 @@ export class Connection {
     }
   }
 
-  private handlePeerSend(to: string | undefined, body: string): void {
+  private handlePeerSend(to: SessionId, message: import("@pi-relay/shared").PeerMessage): void {
     const room = this.rooms.findBySession(this.sessionId);
     if (!room) {
       this.sendError("room_not_in", "join a room before sending", "peer.send");
-      return;
-    }
-    if (to === undefined) {
-      // Broadcast to all other peers.
-      for (const member of room.members.values()) {
-        if (member.sessionId === this.sessionId) continue;
-        member.send({ type: "peer.send.delivered", from: this.sessionId, body });
-      }
+      this.send({
+        type: "peer.ack",
+        messageId: message.id,
+        delivered: false,
+        reason: "not in a room",
+      });
       return;
     }
     const target = room.members.get(to);
     if (!target) {
       this.sendError("peer_not_found", `no peer ${to} in this room`, "peer.send");
+      this.send({
+        type: "peer.ack",
+        messageId: message.id,
+        delivered: false,
+        reason: "peer not found",
+      });
       return;
     }
-    target.send({ type: "peer.send.delivered", from: this.sessionId, body });
+    target.send({ type: "peer.message", from: this.sessionId, message });
+    this.send({ type: "peer.ack", messageId: message.id, delivered: true });
   }
 
-  private handlePeerAsk(to: string, requestId: string, body: string): void {
+  private handlePresenceUpdate(info: Partial<Omit<SessionInfo, "sessionId">>): void {
+    // Patch local identity.
+    this.info = { ...this.info, ...info };
     const room = this.rooms.findBySession(this.sessionId);
-    if (!room) {
-      this.sendError("room_not_in", "join a room before asking", "peer.ask");
-      return;
+    if (!room) return;
+    for (const member of room.members.values()) {
+      if (member.sessionId === this.sessionId) continue;
+      member.send({ type: "room.peer-presence", sessionId: this.sessionId, info });
     }
-    const target = room.members.get(to);
-    if (!target) {
-      this.sendError("peer_not_found", `no peer ${to} in this room`, "peer.ask");
-      return;
-    }
-    target.send({ type: "peer.ask.delivered", from: this.sessionId, requestId, body });
   }
 
-  private handlePeerReply(to: string, requestId: string, body: string): void {
-    const room = this.rooms.findBySession(this.sessionId);
-    if (!room) {
-      this.sendError("room_not_in", "join a room before replying", "peer.reply");
-      return;
-    }
-    const target = room.members.get(to);
-    if (!target) {
-      this.sendError("peer_not_found", `no peer ${to} in this room`, "peer.reply");
-      return;
-    }
-    target.send({ type: "peer.reply.delivered", from: this.sessionId, requestId, body });
-  }
-
-  /** Called by the server on socket close. */
   onClose(): void {
     if (this.state === "closed") return;
     this.state = "closed";

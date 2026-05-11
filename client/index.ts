@@ -26,13 +26,43 @@ import { InlineMessageComponent, type InlineMessageDetails } from "./ui/inline-m
 
 const PRESENCE_NAME_FALLBACK = "pi-agent";
 
+/** Initial delay before checking idle-state to deliver a queued inbound message. */
+const INBOUND_FLUSH_DELAY_MS = 200;
+/** Retry interval while the agent is still busy. */
+const INBOUND_IDLE_RETRY_MS = 500;
+
+interface PendingInbound {
+  from: SessionInfo;
+  message: Message;
+  expectsReply: boolean;
+}
+
 export default function piRelayExtension(pi: ExtensionAPI): void {
   let client: RelayClient | null = null;
   let config: RelayConfig | null = null;
   let runtimeCtx: ExtensionContext | null = null;
-  /** Notify the user via banner if a UI is attached. No-op otherwise. */
+  const pendingInbound: PendingInbound[] = [];
+  let inboundFlushTimer: NodeJS.Timeout | null = null;
+  /**
+   * Notify the user via banner if a UI is attached. No-op when there is no
+   * live UI context. Also writes to stderr for debug visibility, since pi's
+   * notification banner can be missed in dense output.
+   */
   const notify = (message: string, level: "info" | "warning" | "error" = "info"): void => {
-    if (runtimeCtx?.hasUI) runtimeCtx.ui.notify(message, level);
+    const ctx = runtimeCtx;
+    try {
+      if (ctx?.hasUI) ctx.ui.notify(message, level);
+    } catch (err) {
+      process.stderr.write(`[pi-relay] notify failed: ${(err as Error).message}\n`);
+    }
+    // Always echo to stderr so we have a trail even if the banner is missed.
+    process.stderr.write(`[pi-relay ${level}] ${message}\n`);
+  };
+
+  const debug = (message: string): void => {
+    if (process.env.PI_RELAY_DEBUG) {
+      process.stderr.write(`[pi-relay debug] ${message}\n`);
+    }
   };
 
   // --------------------------------------------------------------------
@@ -43,10 +73,13 @@ export default function piRelayExtension(pi: ExtensionAPI): void {
     const sessionName = pi.getSessionName();
     if (sessionName && sessionName.trim()) return sessionName.trim();
     if (config?.displayName?.trim()) return config.displayName.trim();
+    // Include a short pid-based suffix so multiple sessions on the same
+    // hostname (very common during local testing) get unique default names.
+    const pidHint = process.pid.toString(36).slice(-3);
     try {
-      return `${PRESENCE_NAME_FALLBACK}@${hostname()}`;
+      return `${PRESENCE_NAME_FALLBACK}@${hostname()}-${pidHint}`;
     } catch {
-      return PRESENCE_NAME_FALLBACK;
+      return `${PRESENCE_NAME_FALLBACK}-${pidHint}`;
     }
   }
 
@@ -142,13 +175,29 @@ export default function piRelayExtension(pi: ExtensionAPI): void {
     return client;
   }
 
-  function findPeerByIdOrName(c: RelayClient, idOrName: string): SessionInfo | undefined {
+  function findPeerByIdOrName(c: RelayClient, query: string): SessionInfo | undefined {
     const peers = c.listSessions();
-    const direct = peers.find((p) => p.id === idOrName);
-    if (direct) return direct;
-    const named = peers.filter((p) => p.name?.toLowerCase() === idOrName.toLowerCase());
+    // 1. Exact session id match.
+    const exact = peers.find((p) => p.id === query);
+    if (exact) return exact;
+    // 2. Prefix match on session id (require at least 6 chars to keep collisions rare).
+    if (query.length >= 6) {
+      const prefixed = peers.filter((p) => p.id.startsWith(query));
+      if (prefixed.length === 1) return prefixed[0];
+      if (prefixed.length > 1) {
+        throw new Error(
+          `Ambiguous session-id prefix "${query}". Use the full id from intercom_list.`,
+        );
+      }
+    }
+    // 3. Exact name match (case-insensitive).
+    const named = peers.filter((p) => p.name?.toLowerCase() === query.toLowerCase());
     if (named.length === 1) return named[0];
-    if (named.length > 1) throw new Error(`Multiple peers named "${idOrName}". Use a session id instead.`);
+    if (named.length > 1) {
+      throw new Error(
+        `Multiple peers named "${query}". Use a session id from intercom_list (the long uuid).`,
+      );
+    }
     return undefined;
   }
 
@@ -162,13 +211,18 @@ export default function piRelayExtension(pi: ExtensionAPI): void {
 
   pi.on("session_start", async (_event, ctx) => {
     runtimeCtx = ctx;
+    debug("session_start fired");
     try {
       config = await loadConfig();
+      debug(`config loaded: ${JSON.stringify(config)}`);
     } catch (err) {
       notify(`pi-relay config error: ${(err as Error).message}`, "error");
       return;
     }
-    if (config.enabled === false) return;
+    if (config.enabled === false) {
+      debug("pi-relay disabled in config; skipping connect");
+      return;
+    }
     try {
       await ensureConnected();
     } catch (err) {
@@ -197,7 +251,7 @@ export default function piRelayExtension(pi: ExtensionAPI): void {
     description: "Send a fire-and-forget message to another pi session in the current pi-relay room. Use this when you want to share information without expecting a structured reply.",
     promptSnippet: "Send a one-way message to another pi session via pi-relay.",
     parameters: Type.Object({
-      to: Type.String({ description: "Recipient session id or name." }),
+      to: Type.String({ description: "Recipient session id (uuid from intercom_list). A 6+ char prefix is also accepted if unambiguous." }),
       message: Type.String({ description: "Plain-text body of the message." }),
     }),
     async execute(_id, params) {
@@ -219,7 +273,7 @@ export default function piRelayExtension(pi: ExtensionAPI): void {
     description: "Send a question to another pi session and block until they reply, with a 10-minute timeout. Use this when you need a structured answer to continue your work.",
     promptSnippet: "Ask another pi session a question and wait for their reply.",
     parameters: Type.Object({
-      to: Type.String({ description: "Recipient session id or name." }),
+      to: Type.String({ description: "Recipient session id (uuid from intercom_list). A 6+ char prefix is also accepted if unambiguous." }),
       question: Type.String({ description: "The question to ask." }),
       timeoutMinutes: Type.Optional(Type.Number({
         description: "Timeout in minutes. Defaults to 10. Maximum 60.",
@@ -291,10 +345,14 @@ export default function piRelayExtension(pi: ExtensionAPI): void {
           const tags: string[] = [];
           if (p.id === c.sessionId) tags.push("self");
           if (p.status) tags.push(p.status);
-          const suffix = tags.length ? ` [${tags.join(", ")}]` : "";
-          return `- ${p.name ?? "(unnamed)"} (${p.id.slice(0, 8)})${suffix}`;
+          const tagSuffix = tags.length ? ` [${tags.join(", ")}]` : "";
+          const meta = [p.cwd, p.model].filter(Boolean).join(" • ");
+          const metaLine = meta ? `\n    ${meta}` : "";
+          return `- id: ${p.id}${tagSuffix}\n    name: ${p.name ?? "(unnamed)"}${metaLine}`;
         });
-        return textResult(`Room ${c.room}:\n${lines.join("\n")}`);
+        return textResult(
+          `Room ${c.room} (${peers.length} peer${peers.length === 1 ? "" : "s"}):\n${lines.join("\n")}\n\nUse the full \`id\` (uuid) as the \`to\` parameter in intercom_send / intercom_ask / intercom_reply.`,
+        );
       } catch (err) {
         return textResult((err as Error).message);
       }
@@ -349,25 +407,31 @@ export default function piRelayExtension(pi: ExtensionAPI): void {
   pi.registerCommand("intercom", {
     description: "Manage pi-relay room: /intercom new | join <code> | leave | status | overlay",
     handler: async (args, ctx) => {
+      // Refresh runtime context — pi may issue a fresh ctx per command call.
+      runtimeCtx = ctx;
       const cmdCtx = ctx as ExtensionCommandContext;
       const tokens = args.trim().split(/\s+/).filter(Boolean);
       const sub = tokens[0]?.toLowerCase() ?? "overlay";
+      debug(`/intercom received args=${JSON.stringify(args)} sub=${sub}`);
 
       try {
         if (sub === "new") {
+          notify("pi-relay: creating room…", "info");
           const c = await ensureConnected();
+          debug(`creating room, sessionId=${c.sessionId}, connected=${c.connected}`);
           const code = await c.createRoom();
           await updateConfig({ room: code });
           if (config) config.room = code;
-          notify(`pi-relay room created: ${code}`, "info");
+          notify(`pi-relay room created: ${code} (share this with the other side)`, "info");
           return;
         }
         if (sub === "join") {
           const code = tokens[1];
           if (!code) {
-            notify("Usage: /intercom join <code>", "warning");
+            notify("Usage: /intercom join <room-code>  (e.g. /intercom join ABC-234)", "warning");
             return;
           }
+          notify(`pi-relay: joining room ${code}…`, "info");
           const c = await ensureConnected();
           await c.joinRoom(code);
           await updateConfig({ room: code });
@@ -405,6 +469,7 @@ export default function piRelayExtension(pi: ExtensionAPI): void {
         notify(`Unknown /intercom subcommand: ${sub}. Try: new, join, leave, status, overlay`, "warning");
       } catch (err) {
         notify(`/intercom ${sub} failed: ${(err as Error).message}`, "error");
+        process.stderr.write(`[pi-relay] /intercom ${sub} error stack: ${(err as Error).stack ?? ""}\n`);
       }
     },
   });
