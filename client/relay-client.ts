@@ -23,8 +23,8 @@ import type {
   PeerMessage as WirePeerMessage,
   ServerMessage as WireServerMessage,
   SessionInfo as WireSessionInfo,
-} from "@pi-relay/shared";
-import { PROTOCOL_VERSION } from "@pi-relay/shared";
+} from "./wire-protocol.ts";
+import { PROTOCOL_VERSION } from "./wire-protocol.ts";
 import type { Attachment, Message, SessionInfo } from "./types.ts";
 
 const RECONNECT_INITIAL_MS = 500;

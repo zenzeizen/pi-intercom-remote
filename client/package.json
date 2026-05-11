@@ -1,8 +1,7 @@
 {
-  "name": "pi-relay",
-  "version": "0.0.0",
-  "private": true,
-  "description": "pi extension: join cross-machine pi sessions via a WebSocket relay.",
+  "name": "pi-intercom-remote",
+  "version": "0.1.0",
+  "description": "pi extension: connect two pi.dev coding-agent sessions on different machines through a WebSocket relay. Cross-machine sibling of pi-intercom.",
   "license": "MIT",
   "type": "module",
   "main": "index.ts",
@@ -12,11 +11,19 @@
     "config.ts",
     "relay-client.ts",
     "reply-tracker.ts",
+    "wire-protocol.ts",
     "ui/**/*.ts",
-    "skills/**/*"
+    "skills/**/*",
+    "README.md",
+    "NOTICE.md"
   ],
   "keywords": [
-    "pi-package"
+    "pi-package",
+    "pi-intercom",
+    "pi.dev",
+    "coding-agent",
+    "relay",
+    "intercom"
   ],
   "pi": {
     "extensions": [
@@ -34,7 +41,6 @@
     "@earendil-works/pi-tui": "^0.74.0"
   },
   "dependencies": {
-    "@pi-relay/shared": "*",
     "ws": "^8.18.0",
     "typebox": "^1.1.24"
   },

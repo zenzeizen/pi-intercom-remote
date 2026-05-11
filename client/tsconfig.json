@@ -6,6 +6,5 @@
     "allowImportingTsExtensions": true
   },
   "include": ["**/*.ts"],
-  "exclude": ["node_modules", "skills"],
-  "references": [{ "path": "../shared" }]
+  "exclude": ["node_modules", "skills"]
 }
