@@ -1,35 +1,74 @@
-/**
- * /intercom overlay: lists peers in the current room and lets the user pick
- * one to message. Confirming on a peer prompts for message text via the
- * standard ui.input dialog and sends a fire-and-forget peer.send.
- *
- * Intentionally minimal compared to pi-intercom's overlay — no presence
- * sparkline, no compose-with-attachments. v1 keeps it functional; richer
- * UX can come later without changing the protocol.
- */
-
-import type { Component, KeybindingsManager, OverlayHandle } from "@earendil-works/pi-tui";
+import type { Component } from "@earendil-works/pi-tui";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import type { ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
-import type { RelayClient } from "../relay-client.ts";
+import type { KeybindingsManager, Theme } from "@earendil-works/pi-coding-agent";
 import type { SessionInfo } from "../types.ts";
 
-function shortId(id: string): string {
-  return id.slice(0, 8);
+function middleTruncate(text: string, maxWidth: number): string {
+  if (visibleWidth(text) <= maxWidth) {
+    return text;
+  }
+  if (maxWidth <= 3) {
+    return truncateToWidth(text, maxWidth, "");
+  }
+
+  const chars = [...text];
+  const targetSideWidth = Math.max(1, Math.floor((maxWidth - 1) / 2));
+
+  let left = "";
+  for (const char of chars) {
+    if (visibleWidth(left + char) > targetSideWidth) break;
+    left += char;
+  }
+
+  let right = "";
+  for (const char of chars.slice().reverse()) {
+    if (visibleWidth(char + right) > targetSideWidth) break;
+    right = char + right;
+  }
+
+  return truncateToWidth(`${left}…${right}`, maxWidth, "");
 }
 
-class SessionListOverlay implements Component {
+function shortSessionId(sessionId: string): string {
+  return sessionId.slice(0, 8);
+}
+
+function sessionTitle(session: SessionInfo, options?: { self?: boolean; sameCwd?: boolean }): string {
+  const name = session.name || "Unnamed session";
+  const tags = [options?.self ? "self" : undefined, options?.sameCwd ? "same cwd" : undefined]
+    .filter((tag): tag is string => Boolean(tag));
+  const suffix = tags.length ? ` [${tags.join(", ")}]` : "";
+  return `${name} (${shortSessionId(session.id)})${suffix}`;
+}
+
+export class SessionListOverlay implements Component {
+  private theme: Theme;
+  private keybindings: KeybindingsManager;
+  private currentSession: SessionInfo;
+  private done: (result: SessionInfo | undefined) => void;
+  private sessions: SessionInfo[];
   private selectedIndex = 0;
-  private readonly maxVisible = 8;
+  private maxVisible = 8;
 
   constructor(
-    private readonly theme: Theme,
-    private readonly keybindings: KeybindingsManager,
-    private readonly selfId: string | undefined,
-    private readonly room: string | undefined,
-    private readonly peers: SessionInfo[],
-    private readonly done: (selected: SessionInfo | undefined) => void,
-  ) {}
+    theme: Theme,
+    keybindings: KeybindingsManager,
+    currentSession: SessionInfo,
+    sessions: SessionInfo[],
+    done: (result: SessionInfo | undefined) => void,
+  ) {
+    this.theme = theme;
+    this.keybindings = keybindings;
+    this.currentSession = currentSession;
+    this.sessions = sessions;
+    this.done = done;
+  }
+
+  private onSessionSelect(sessionId: string): void {
+    const session = this.sessions.find(s => s.id === sessionId);
+    if (!session) return;
+    this.done(session);
+  }
 
   invalidate(): void {}
 
@@ -38,107 +77,86 @@ class SessionListOverlay implements Component {
       this.done(undefined);
       return;
     }
-    if (this.peers.length === 0) return;
+
+    if (this.sessions.length === 0) {
+      return;
+    }
+
     if (this.keybindings.matches(data, "tui.select.up")) {
-      this.selectedIndex = (this.selectedIndex + this.peers.length - 1) % this.peers.length;
+      this.selectedIndex = this.selectedIndex === 0 ? this.sessions.length - 1 : this.selectedIndex - 1;
       return;
     }
+
     if (this.keybindings.matches(data, "tui.select.down")) {
-      this.selectedIndex = (this.selectedIndex + 1) % this.peers.length;
+      this.selectedIndex = this.selectedIndex === this.sessions.length - 1 ? 0 : this.selectedIndex + 1;
       return;
     }
+
     if (this.keybindings.matches(data, "tui.select.confirm")) {
-      const peer = this.peers[this.selectedIndex];
-      if (peer) this.done(peer);
+      const session = this.sessions[this.selectedIndex];
+      if (session) {
+        this.onSessionSelect(session.id);
+      }
     }
   }
 
   render(width: number): string[] {
     const innerWidth = Math.max(36, Math.min(width - 2, 88));
     const contentWidth = Math.max(1, innerWidth - 2);
+    const footer = `${this.keybindings.getKeys("tui.select.confirm").join("/")}: Message • ${this.keybindings.getKeys("tui.select.cancel").join("/")}: Close`;
     const border = (text: string) => this.theme.fg("accent", text);
-    const dim = (text: string) => this.theme.fg("dim", text);
-    const row = (text = ""): string => {
+    const row = (text = "") => {
       const clipped = truncateToWidth(text, contentWidth, "", true);
-      const padding = " ".repeat(Math.max(0, contentWidth - visibleWidth(clipped)));
-      return `${border("│")}${clipped}${padding}${border("│")}`;
+      return `${border("│")}${clipped}${" ".repeat(Math.max(0, contentWidth - visibleWidth(clipped)))}${border("│")}`;
     };
 
-    const footer = `${this.keybindings.getKeys("tui.select.confirm").join("/")}: Send to peer • ${this.keybindings.getKeys("tui.select.cancel").join("/")}: Close`;
     const lines: string[] = [];
     lines.push(border(`╭${"─".repeat(contentWidth)}╮`));
-    lines.push(row(this.theme.bold(" pi-relay")));
-    lines.push(row(dim(` Room: ${this.room ?? "(not in a room)"}`)));
+    lines.push(row(this.theme.bold(" Current Session")));
     lines.push(border(`├${"─".repeat(contentWidth)}┤`));
+    lines.push(row());
+    lines.push(row(`  ${this.theme.fg("dim", sessionTitle(this.currentSession, { self: true }))}`));
+    lines.push(row(`  ${this.theme.fg("dim", `${middleTruncate(this.currentSession.cwd, Math.max(8, contentWidth - 4))} • ${this.currentSession.model}`)}`));
+    lines.push(row());
+    lines.push(border(`├${"─".repeat(contentWidth)}┤`));
+    lines.push(row(this.theme.bold(" Other Sessions")));
+    lines.push(row());
 
-    if (this.peers.length === 0) {
-      lines.push(row(dim(" No peers in this room.")));
-      lines.push(row(dim(" Use /intercom join <code> to join one.")));
+    if (this.sessions.length === 0) {
+      lines.push(row(this.theme.fg("dim", " No other intercom-connected sessions")));
     } else {
       const startIndex = Math.max(
         0,
-        Math.min(this.selectedIndex - Math.floor(this.maxVisible / 2), this.peers.length - this.maxVisible),
+        Math.min(this.selectedIndex - Math.floor(this.maxVisible / 2), this.sessions.length - this.maxVisible),
       );
-      const endIndex = Math.min(startIndex + this.maxVisible, this.peers.length);
-      for (let i = startIndex; i < endIndex; i++) {
-        const peer = this.peers[i]!;
-        const isSelected = i === this.selectedIndex;
-        const isSelf = peer.id === this.selfId;
-        const tags = [isSelf ? "self" : undefined, peer.status].filter((t): t is string => Boolean(t));
-        const tagSuffix = tags.length ? ` [${tags.join(", ")}]` : "";
-        const name = peer.name ?? "(unnamed)";
-        const title = `${name} (${shortId(peer.id)})${tagSuffix}`;
+      const endIndex = Math.min(startIndex + this.maxVisible, this.sessions.length);
+
+      for (let index = startIndex; index < endIndex; index += 1) {
+        const session = this.sessions[index]!;
+        const isSelected = index === this.selectedIndex;
+        const sameCwd = session.cwd === this.currentSession.cwd;
         const prefix = isSelected ? this.theme.fg("accent", "→ ") : "  ";
+        const title = sessionTitle(session, { sameCwd });
+        const pathText = `${middleTruncate(session.cwd, Math.max(8, contentWidth - 4))} • ${session.model}`;
+
         lines.push(row(`${prefix}${isSelected ? this.theme.fg("accent", title) : title}`));
-        if (peer.cwd || peer.model) {
-          lines.push(row(dim(`    ${[peer.cwd, peer.model].filter(Boolean).join(" • ")}`)));
+        lines.push(row(`  ${this.theme.fg("dim", pathText)}`));
+        if (index < endIndex - 1) {
+          lines.push(row());
         }
+      }
+
+      if (startIndex > 0 || endIndex < this.sessions.length) {
+        lines.push(row());
+        lines.push(row(this.theme.fg("dim", ` ${this.selectedIndex + 1}/${this.sessions.length}`)));
       }
     }
 
+    lines.push(row());
     lines.push(border(`├${"─".repeat(contentWidth)}┤`));
-    lines.push(row(dim(` ${footer}`)));
+    lines.push(row(this.theme.fg("dim", ` ${footer}`)));
     lines.push(border(`╰${"─".repeat(contentWidth)}╯`));
+
     return lines;
-  }
-}
-
-export async function openSessionListOverlay(
-  ctx: ExtensionContext,
-  client: RelayClient,
-): Promise<void> {
-  if (!ctx.hasUI) return;
-  const peers = client.listSessions();
-  let handle: OverlayHandle | undefined;
-  const selectedPeer = await ctx.ui.custom<SessionInfo | undefined>(
-    (_tui, theme, keybindings, done) => {
-      return new SessionListOverlay(
-        theme,
-        keybindings,
-        client.sessionId,
-        client.room,
-        peers.filter((p) => p.id !== client.sessionId), // exclude self from selectable list
-        (result) => {
-          handle?.hide();
-          done(result);
-        },
-      );
-    },
-    {
-      overlay: true,
-      onHandle: (h) => {
-        handle = h;
-      },
-    },
-  );
-  if (!selectedPeer) return;
-
-  const text = await ctx.ui.input(`Message to ${selectedPeer.name ?? shortId(selectedPeer.id)}`, "Type your message…");
-  if (!text || !text.trim()) return;
-  try {
-    await client.send(selectedPeer.id, { text: text.trim() });
-    ctx.ui.notify(`pi-relay: sent to ${selectedPeer.name ?? shortId(selectedPeer.id)}`, "info");
-  } catch (err) {
-    ctx.ui.notify(`pi-relay send failed: ${(err as Error).message}`, "error");
   }
 }

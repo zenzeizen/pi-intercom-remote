@@ -17,13 +17,20 @@ export const PROTOCOL_VERSION = 1 as const;
 export type SessionId = string;
 export type RoomCode = string;
 
-/** Metadata a session advertises about itself to peers. */
+/**
+ * Metadata a session advertises about itself to peers. Mirrors pi-intercom's
+ * `SessionInfo` shape (minus the `id`, which lives in `sessionId`) so the
+ * client's UI overlays can consume it directly after a small adapter.
+ */
 export interface SessionInfo {
   sessionId: SessionId;
   name: string;
   cwd?: string;
   model?: string;
-  status?: "idle" | "thinking" | "tool";
+  pid?: number;
+  startedAt?: number;
+  lastActivity?: number;
+  status?: string;
 }
 
 // --- Peer message payload (mirrors pi-intercom Message) -----------------

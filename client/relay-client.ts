@@ -1,14 +1,18 @@
 /**
- * RelayClient — the pi-relay client's connection to the relay server.
+ * RelayClient — pi-relay's WebSocket client.
  *
- * Translates pi-intercom-shaped operations (`send`, `ask`, `reply`,
- * `listSessions`) into pi-relay wire frames and vice versa. Emits semantic
- * events the extension layer hooks into:
- *   - "connected" / "disconnected"
- *   - "peer_joined" (SessionInfo)
- *   - "peer_left" (sessionId, reason)
- *   - "message" (from, Message)             — fire-and-forget peer.send
- *   - "ask" (from, Message)                  — peer.ask, expecting our reply
+ * API mirrors pi-intercom's IntercomClient (sessionId, isConnected,
+ * listSessions, send, updatePresence, disconnect, EventEmitter events:
+ * `message` / `session_joined` / `session_left` / `presence_update` /
+ * `disconnected` / `error`) so the extension layer reads as a near-line
+ * port of pi-intercom's index.ts.
+ *
+ * Adds pi-relay-only room operations (createRoom, joinRoom, leaveRoom,
+ * `room_changed` event) since pi-relay groups sessions into rooms instead
+ * of pi-intercom's single global pool.
+ *
+ * Translates between the wire protocol (@pi-relay/shared) and the
+ * pi-intercom-shaped Message / SessionInfo types in ./types.ts.
  */
 
 import { EventEmitter } from "node:events";
@@ -16,59 +20,133 @@ import { randomUUID } from "node:crypto";
 import WebSocket from "ws";
 import type {
   ClientMessage as WireClientMessage,
+  PeerMessage as WirePeerMessage,
   ServerMessage as WireServerMessage,
   SessionInfo as WireSessionInfo,
 } from "@pi-relay/shared";
 import { PROTOCOL_VERSION } from "@pi-relay/shared";
-import type { Message, SendResult, SessionInfo } from "./types.ts";
-import { ReplyTracker } from "./reply-tracker.ts";
+import type { Attachment, Message, SessionInfo } from "./types.ts";
 
 const RECONNECT_INITIAL_MS = 500;
 const RECONNECT_MAX_MS = 30_000;
-const DEFAULT_ASK_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes (pi-intercom parity)
+const SEND_ACK_TIMEOUT_MS = 10_000;
+
+export interface SendOptions {
+  text: string;
+  attachments?: Attachment[];
+  replyTo?: string;
+  expectsReply?: boolean;
+  messageId?: string;
+}
+
+export interface SendResult {
+  id: string;
+  delivered: boolean;
+  reason?: string;
+}
 
 export interface RelayClientOptions {
   url: string;
-  identity: Omit<WireSessionInfo, "sessionId">;
   authCredential?: string;
-  /** Auto-rejoin this room after every (re)connect. */
-  room?: string;
+  /** Identity to advertise via hello. */
+  identity: Omit<SessionInfo, "id" | "lastActivity">;
 }
 
-interface SendInternalOptions {
-  text: string;
-  messageId?: string;
-  replyTo?: string;
-  expectsReply?: boolean;
-  /** Internal: timeout for ask (ignored if expectsReply is false). */
-  askTimeoutMs?: number;
-}
+/**
+ * Pluggable filter for inbound peer.message frames. Used at the index.ts
+ * layer to absorb reply messages addressed to an outstanding ask before
+ * they're emitted to the rest of the system.
+ *
+ * Return true to consume the message (suppress the `message` event), false
+ * to let it through.
+ */
+export type InboundMessageFilter = (from: SessionInfo, message: Message) => boolean;
 
 export class RelayClient extends EventEmitter {
   private ws?: WebSocket;
-  private _sessionId?: string;
-  private _room?: string;
+  private _sessionId: string | null = null;
+  private _room: string | null = null;
   private peers = new Map<string, SessionInfo>();
-  private readonly tracker = new ReplyTracker();
+  private pendingSends = new Map<
+    string,
+    { resolve: (r: SendResult) => void; reject: (e: Error) => void; timer: NodeJS.Timeout }
+  >();
   private reconnectAttempt = 0;
-  private reconnectTimer?: NodeJS.Timeout;
+  private reconnectTimer: NodeJS.Timeout | null = null;
   private explicitlyClosed = false;
-  /** Resolves when the welcome frame is received (per-connection). */
-  private welcomePending?: { resolve: () => void; reject: (e: Error) => void };
-  /** Resolves when a pending room.create / room.join completes. */
-  private roomOpPending?: {
+  private welcomePending: { resolve: () => void; reject: (e: Error) => void } | null = null;
+  private roomOpPending: {
     kind: "create" | "join";
-    code?: string;
     resolve: (code: string) => void;
     reject: (e: Error) => void;
-  };
+  } | null = null;
+  private inboundFilter: InboundMessageFilter | null = null;
 
   constructor(private readonly opts: RelayClientOptions) {
     super();
-    this._room = opts.room;
   }
 
-  // --- Lifecycle ---------------------------------------------------------
+  // --- pi-intercom-compatible API ---------------------------------------
+
+  get sessionId(): string | null {
+    return this._sessionId;
+  }
+
+  isConnected(): boolean {
+    return this.ws?.readyState === WebSocket.OPEN && this._sessionId !== null;
+  }
+
+  /** Returns the locally cached peer list. (RelayClient maintains it from room.* frames.) */
+  listSessions(): Promise<SessionInfo[]> {
+    if (!this.isConnected()) return Promise.reject(new Error("Not connected"));
+    return Promise.resolve([...this.peers.values()]);
+  }
+
+  send(to: string, options: SendOptions): Promise<SendResult> {
+    if (!this.isConnected()) {
+      return Promise.reject(new Error("Not connected"));
+    }
+    if (!this.peers.has(to) && to !== this._sessionId) {
+      return Promise.reject(new Error(`No peer ${to} in current room`));
+    }
+    const messageId = options.messageId ?? randomUUID();
+    const message: WirePeerMessage = {
+      id: messageId,
+      timestamp: Date.now(),
+      ...(options.replyTo ? { replyTo: options.replyTo } : {}),
+      ...(options.expectsReply ? { expectsReply: options.expectsReply } : {}),
+      content: {
+        text: options.text,
+        ...(options.attachments ? { attachments: options.attachments } : {}),
+      },
+    };
+
+    return new Promise<SendResult>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        if (this.pendingSends.has(messageId)) {
+          this.pendingSends.delete(messageId);
+          reject(new Error("Send timeout"));
+        }
+      }, SEND_ACK_TIMEOUT_MS);
+      this.pendingSends.set(messageId, { resolve, reject, timer });
+      try {
+        this.sendWire({ type: "peer.send", to, message });
+      } catch (err) {
+        clearTimeout(timer);
+        this.pendingSends.delete(messageId);
+        reject(err as Error);
+      }
+    });
+  }
+
+  updatePresence(updates: { name?: string; status?: string; model?: string; cwd?: string }): void {
+    if (!this.isConnected()) return;
+    try {
+      this.sendWire({ type: "presence.update", info: updates });
+    } catch {
+      // best-effort
+    }
+  }
 
   async connect(): Promise<void> {
     this.explicitlyClosed = false;
@@ -77,49 +155,34 @@ export class RelayClient extends EventEmitter {
 
   async disconnect(): Promise<void> {
     this.explicitlyClosed = true;
-    clearTimeout(this.reconnectTimer);
-    this.tracker.rejectAllOutbound(new Error("client disconnecting"));
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.failPendingSends(new Error("Client disconnecting"));
     if (this.ws && this.ws.readyState !== WebSocket.CLOSED) {
       this.ws.close(1000, "client disconnect");
     }
   }
 
-  get sessionId(): string | undefined {
-    return this._sessionId;
-  }
+  // --- pi-relay-only room operations ------------------------------------
 
-  get room(): string | undefined {
+  get room(): string | null {
     return this._room;
   }
 
-  get connected(): boolean {
-    return this.ws?.readyState === WebSocket.OPEN && this._sessionId !== undefined;
-  }
-
-  listSessions(): SessionInfo[] {
-    return [...this.peers.values()];
-  }
-
-  // --- Room operations ---------------------------------------------------
-
-  /** Create a new room and join it. Returns the new room code. */
   async createRoom(): Promise<string> {
-    if (!this.connected) throw new Error("not connected to relay");
-    if (this.roomOpPending) throw new Error("another room operation is in flight");
+    if (!this.isConnected()) throw new Error("Not connected");
+    if (this.roomOpPending) throw new Error("Another room operation is in flight");
     return new Promise<string>((resolve, reject) => {
       this.roomOpPending = { kind: "create", resolve, reject };
       this.sendWire({ type: "room.create" });
     });
   }
 
-  /** Join an existing room by code. */
   async joinRoom(code: string): Promise<void> {
-    if (!this.connected) throw new Error("not connected to relay");
-    if (this.roomOpPending) throw new Error("another room operation is in flight");
+    if (!this.isConnected()) throw new Error("Not connected");
+    if (this.roomOpPending) throw new Error("Another room operation is in flight");
     await new Promise<void>((resolve, reject) => {
       this.roomOpPending = {
         kind: "join",
-        code,
         resolve: () => resolve(),
         reject,
       };
@@ -127,87 +190,39 @@ export class RelayClient extends EventEmitter {
     });
   }
 
-  /** Leave the current room without disconnecting from the relay. */
   leaveRoom(): void {
     if (!this._room) return;
-    this.sendWire({ type: "room.leave" });
-    this._room = undefined;
+    try {
+      this.sendWire({ type: "room.leave" });
+    } catch {
+      // best-effort
+    }
+    const prevRoom = this._room;
+    this._room = null;
     this.peers.clear();
+    this.emit("room_changed", { room: null, previous: prevRoom });
   }
 
-  // --- Messaging ---------------------------------------------------------
-
-  /**
-   * Fire-and-forget or blocking peer message. If `expectsReply` is true the
-   * promise resolves with the peer's reply Message; otherwise it resolves
-   * with `{ delivered: true }` (or rejects on routing error).
-   */
-  async send(to: string, opts: SendInternalOptions): Promise<SendResult | Message> {
-    if (!this.connected) throw new Error("not connected to relay");
-    if (!this._room) throw new Error("not in a room — call createRoom or joinRoom first");
-    if (!this.peers.has(to)) throw new Error(`no peer ${to} in current room`);
-
-    const messageId = opts.messageId ?? randomUUID();
-
-    if (opts.expectsReply) {
-      // Wire-level: peer.ask. Client-level: returns the reply Message.
-      this.sendWire({
-        type: "peer.ask",
-        to,
-        requestId: messageId,
-        body: opts.text,
-      });
-      return new Promise<Message>((resolve, reject) => {
-        const timeoutMs = opts.askTimeoutMs ?? DEFAULT_ASK_TIMEOUT_MS;
-        const timer = setTimeout(() => {
-          this.tracker.resolveOutbound(messageId, {
-            id: randomUUID(),
-            timestamp: Date.now(),
-            replyTo: messageId,
-            content: { text: "" },
-          });
-          reject(new Error(`ask timed out after ${timeoutMs}ms`));
-        }, timeoutMs);
-        this.tracker.registerOutbound({
-          requestId: messageId,
-          to: this.peers.get(to)!,
-          body: opts.text,
-          startedAt: Date.now(),
-          resolve,
-          reject,
-          timer,
-        });
-      });
-    }
-
-    if (opts.replyTo) {
-      // peer.reply
-      this.sendWire({
-        type: "peer.reply",
-        to,
-        requestId: opts.replyTo,
-        body: opts.text,
-      });
-      this.tracker.resolveInbound(opts.replyTo);
-    } else {
-      // Plain peer.send
-      this.sendWire({ type: "peer.send", to, body: opts.text });
-    }
-    return { id: messageId, delivered: true };
+  /** Install or clear a filter that can suppress inbound `message` events. */
+  setInboundMessageFilter(filter: InboundMessageFilter | null): void {
+    this.inboundFilter = filter;
   }
 
-  /** Inbound asks awaiting our reply (for `intercom_pending` UX, deferred for v1). */
-  listPendingAsks(): ReturnType<ReplyTracker["listInbound"]> {
-    return this.tracker.listInbound();
-  }
-
-  // --- Internals ---------------------------------------------------------
+  // --- Internals --------------------------------------------------------
 
   private sendWire(msg: WireClientMessage): void {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       throw new Error("WebSocket is not open");
     }
     this.ws.send(JSON.stringify(msg));
+  }
+
+  private failPendingSends(err: Error): void {
+    for (const pending of this.pendingSends.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(err);
+    }
+    this.pendingSends.clear();
   }
 
   private openSocket(): Promise<void> {
@@ -217,11 +232,18 @@ export class RelayClient extends EventEmitter {
       this.welcomePending = { resolve, reject };
 
       ws.on("open", () => {
-        // Send hello immediately. Welcome will fulfill the connect promise.
+        const identity: Omit<WireSessionInfo, "sessionId"> = {
+          name: this.opts.identity.name ?? "pi-agent",
+          ...(this.opts.identity.cwd ? { cwd: this.opts.identity.cwd } : {}),
+          ...(this.opts.identity.model ? { model: this.opts.identity.model } : {}),
+          ...(this.opts.identity.pid !== undefined ? { pid: this.opts.identity.pid } : {}),
+          ...(this.opts.identity.startedAt !== undefined ? { startedAt: this.opts.identity.startedAt } : {}),
+          ...(this.opts.identity.status ? { status: this.opts.identity.status } : {}),
+        };
         this.sendWire({
           type: "hello",
           protocolVersion: PROTOCOL_VERSION,
-          info: this.opts.identity,
+          info: identity,
           ...(this.opts.authCredential
             ? { auth: { scheme: "token", credential: this.opts.authCredential } }
             : {}),
@@ -239,27 +261,28 @@ export class RelayClient extends EventEmitter {
       });
 
       ws.on("close", (code) => {
-        const wasConnected = this._sessionId !== undefined;
-        this._sessionId = undefined;
+        const wasConnected = this._sessionId !== null;
+        this._sessionId = null;
+        this._room = null;
         this.peers.clear();
-        this.tracker.rejectAllOutbound(new Error("relay connection closed"));
+        this.failPendingSends(new Error("Relay connection closed"));
         if (this.welcomePending) {
-          this.welcomePending.reject(new Error(`relay closed before welcome (code ${code})`));
-          this.welcomePending = undefined;
+          this.welcomePending.reject(new Error(`Relay closed before welcome (code ${code})`));
+          this.welcomePending = null;
         }
-        if (wasConnected) this.emit("disconnected", { code });
+        if (wasConnected) this.emit("disconnected", new Error(`code ${code}`));
         if (!this.explicitlyClosed) this.scheduleReconnect();
       });
 
       ws.on("error", (err) => {
         // 'close' will fire next; let it handle reconnect.
-        this.emit("ws_error", err);
+        this.emit("error", err);
       });
     });
   }
 
   private scheduleReconnect(): void {
-    clearTimeout(this.reconnectTimer);
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     const delay = Math.min(
       RECONNECT_INITIAL_MS * 2 ** this.reconnectAttempt,
       RECONNECT_MAX_MS,
@@ -269,12 +292,6 @@ export class RelayClient extends EventEmitter {
       this.openSocket()
         .then(() => {
           this.reconnectAttempt = 0;
-          // Rejoin the configured room if we had one.
-          if (this._room) {
-            this.joinRoom(this._room).catch((err) => {
-              this.emit("ws_error", err);
-            });
-          }
         })
         .catch(() => {
           this.scheduleReconnect();
@@ -286,89 +303,90 @@ export class RelayClient extends EventEmitter {
     switch (msg.type) {
       case "welcome": {
         this._sessionId = msg.sessionId;
-        this.emit("connected", { sessionId: msg.sessionId });
         this.welcomePending?.resolve();
-        this.welcomePending = undefined;
+        this.welcomePending = null;
         return;
       }
       case "room.created": {
         this._room = msg.code;
         this.peers.clear();
         for (const peer of msg.peers) {
-          this.peers.set(peer.sessionId, this.peerInfoFromWire(peer));
+          this.peers.set(peer.sessionId, this.adaptPeer(peer));
         }
         const pending = this.roomOpPending;
-        this.roomOpPending = undefined;
+        this.roomOpPending = null;
         pending?.resolve(msg.code);
+        this.emit("room_changed", { room: msg.code, previous: null });
         return;
       }
       case "room.joined": {
+        const previous = this._room;
         this._room = msg.code;
         this.peers.clear();
         for (const peer of msg.peers) {
-          this.peers.set(peer.sessionId, this.peerInfoFromWire(peer));
+          this.peers.set(peer.sessionId, this.adaptPeer(peer));
         }
         const pending = this.roomOpPending;
-        this.roomOpPending = undefined;
+        this.roomOpPending = null;
         pending?.resolve(msg.code);
+        this.emit("room_changed", { room: msg.code, previous });
         return;
       }
       case "room.peer-joined": {
-        const info = this.peerInfoFromWire(msg.peer);
-        this.peers.set(info.id, info);
-        this.emit("peer_joined", info);
+        const peer = this.adaptPeer(msg.peer);
+        this.peers.set(peer.id, peer);
+        this.emit("session_joined", peer);
         return;
       }
       case "room.peer-left": {
-        const info = this.peers.get(msg.sessionId);
         this.peers.delete(msg.sessionId);
-        this.tracker.dropInboundFrom(msg.sessionId);
-        this.emit("peer_left", { sessionId: msg.sessionId, reason: msg.reason, info });
+        this.emit("session_left", msg.sessionId);
         return;
       }
-      case "peer.send.delivered": {
-        const message: Message = {
-          id: randomUUID(),
-          timestamp: Date.now(),
-          content: { text: msg.body },
+      case "room.peer-presence": {
+        const existing = this.peers.get(msg.sessionId);
+        if (!existing) return;
+        const merged: SessionInfo = {
+          ...existing,
+          ...(msg.info.name !== undefined ? { name: msg.info.name } : {}),
+          ...(msg.info.cwd !== undefined ? { cwd: msg.info.cwd } : {}),
+          ...(msg.info.model !== undefined ? { model: msg.info.model } : {}),
+          ...(msg.info.status !== undefined ? { status: msg.info.status } : {}),
+          ...(msg.info.pid !== undefined ? { pid: msg.info.pid } : {}),
+          lastActivity: Date.now(),
         };
-        const from = this.peers.get(msg.from);
-        if (from) this.emit("message", from, message);
+        this.peers.set(msg.sessionId, merged);
+        this.emit("presence_update", merged);
         return;
       }
-      case "peer.ask.delivered": {
-        const message: Message = {
-          id: msg.requestId,
-          timestamp: Date.now(),
-          expectsReply: true,
-          content: { text: msg.body },
-        };
-        const from = this.peers.get(msg.from);
-        if (from) {
-          this.tracker.recordInbound({ from, message, receivedAt: Date.now() });
-          this.emit("ask", from, message);
-        }
+      case "peer.message": {
+        const fromInfo = this.peers.get(msg.from);
+        if (!fromInfo) return; // unknown peer (likely already left); drop
+        const message = this.adaptMessage(msg.message);
+        // Bump local last-activity so UI reflects when each peer was last heard from.
+        this.peers.set(msg.from, { ...fromInfo, lastActivity: Date.now() });
+        if (this.inboundFilter && this.inboundFilter(fromInfo, message)) return;
+        this.emit("message", fromInfo, message);
         return;
       }
-      case "peer.reply.delivered": {
-        const message: Message = {
-          id: randomUUID(),
-          timestamp: Date.now(),
-          replyTo: msg.requestId,
-          content: { text: msg.body },
-        };
-        this.tracker.resolveOutbound(msg.requestId, message);
-        const from = this.peers.get(msg.from);
-        if (from) this.emit("reply", from, message);
+      case "peer.ack": {
+        const pending = this.pendingSends.get(msg.messageId);
+        if (!pending) return;
+        clearTimeout(pending.timer);
+        this.pendingSends.delete(msg.messageId);
+        pending.resolve({
+          id: msg.messageId,
+          delivered: msg.delivered,
+          ...(msg.reason ? { reason: msg.reason } : {}),
+        });
         return;
       }
       case "error": {
-        // If it relates to a pending room op, reject that.
         if (this.roomOpPending && (msg.inResponseTo === "room.create" || msg.inResponseTo === "room.join")) {
           this.roomOpPending.reject(new Error(`${msg.code}: ${msg.message}`));
-          this.roomOpPending = undefined;
+          this.roomOpPending = null;
         }
-        this.emit("relay_error", msg);
+        this.emit("error", new Error(`${msg.code}: ${msg.message}`));
         return;
       }
       case "pong":
@@ -380,13 +398,29 @@ export class RelayClient extends EventEmitter {
     }
   }
 
-  private peerInfoFromWire(p: WireSessionInfo): SessionInfo {
+  private adaptPeer(wire: WireSessionInfo): SessionInfo {
     return {
-      id: p.sessionId,
-      name: p.name,
-      cwd: p.cwd,
-      model: p.model,
-      status: p.status,
+      id: wire.sessionId,
+      name: wire.name,
+      cwd: wire.cwd ?? "",
+      model: wire.model ?? "unknown",
+      pid: wire.pid ?? 0,
+      startedAt: wire.startedAt ?? 0,
+      lastActivity: wire.lastActivity ?? Date.now(),
+      ...(wire.status ? { status: wire.status } : {}),
+    };
+  }
+
+  private adaptMessage(wire: WirePeerMessage): Message {
+    return {
+      id: wire.id,
+      timestamp: wire.timestamp,
+      ...(wire.replyTo ? { replyTo: wire.replyTo } : {}),
+      ...(wire.expectsReply ? { expectsReply: wire.expectsReply } : {}),
+      content: {
+        text: wire.content.text,
+        ...(wire.content.attachments ? { attachments: wire.content.attachments } : {}),
+      },
     };
   }
 }

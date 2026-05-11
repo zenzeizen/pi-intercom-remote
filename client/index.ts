@@ -1,12 +1,19 @@
 /**
- * pi-relay extension entry point.
+ * pi-relay extension entry.
  *
- * Wires a RelayClient (cross-machine WebSocket) to pi's extension surface:
- *   - 6 LLM tools (send, ask, reply, list, pending, status)
- *   - /intercom command with sub-actions (new, join, leave, status)
- *   - alt+m shortcut → session list overlay
- *   - Inline renderer for incoming peer messages
- *   - Auto-connect on session_start; clean disconnect on shutdown
+ * Ported from pi-intercom's index.ts: the same `intercom` tool surface with
+ * an action parameter (list / send / ask / reply / pending / status), the
+ * same idle-aware inbound queueing, the same reply-waiter pattern, the same
+ * /intercom overlay command and alt+m shortcut, the same inline message
+ * renderer.
+ *
+ * pi-relay-only additions:
+ *   - Room operations as extra tool actions (`new`, `join`, `leave`) and
+ *     companion /intercom <action> shortcuts.
+ *   - presence sync also pushes cwd (so peer.cwd is correct in the overlay).
+ *
+ * Subagent/supervisor features from pi-intercom are dropped — they are
+ * orthogonal to cross-machine relaying.
  */
 
 import { randomUUID } from "node:crypto";
@@ -20,486 +27,906 @@ import type {
 import { Type } from "typebox";
 import { loadConfig, updateConfig, type RelayConfig } from "./config.ts";
 import { RelayClient } from "./relay-client.ts";
-import type { Message, SessionInfo } from "./types.ts";
-import { openSessionListOverlay } from "./ui/session-list.ts";
-import { InlineMessageComponent, type InlineMessageDetails } from "./ui/inline-message.ts";
+import type { Attachment, Message, SessionInfo } from "./types.ts";
+import { ReplyTracker } from "./reply-tracker.ts";
+import { SessionListOverlay } from "./ui/session-list.ts";
+import { ComposeOverlay, type ComposeResult } from "./ui/compose.ts";
+import { InlineMessageComponent } from "./ui/inline-message.ts";
 
-const PRESENCE_NAME_FALLBACK = "pi-agent";
-
-/** Initial delay before checking idle-state to deliver a queued inbound message. */
 const INBOUND_FLUSH_DELAY_MS = 200;
-/** Retry interval while the agent is still busy. */
 const INBOUND_IDLE_RETRY_MS = 500;
+const ASK_TIMEOUT_MS = 10 * 60 * 1000;
+const DEFAULT_PRESENCE_NAME = "pi-agent";
+const NON_INTERACTIVE_BUSY_REPLY =
+  "This agent is running in non-interactive mode and cannot respond to intercom messages while it is working. It will continue its current task and exit when done.";
 
-interface PendingInbound {
+interface InboundMessageEntry {
   from: SessionInfo;
   message: Message;
-  expectsReply: boolean;
+  replyCommand?: string;
+  bodyText: string;
 }
 
-export default function piRelayExtension(pi: ExtensionAPI): void {
-  let client: RelayClient | null = null;
-  let config: RelayConfig | null = null;
-  let runtimeCtx: ExtensionContext | null = null;
-  const pendingInbound: PendingInbound[] = [];
-  let inboundFlushTimer: NodeJS.Timeout | null = null;
-  /**
-   * Notify the user via banner if a UI is attached. No-op when there is no
-   * live UI context. Also writes to stderr for debug visibility, since pi's
-   * notification banner can be missed in dense output.
-   */
-  const notify = (message: string, level: "info" | "warning" | "error" = "info"): void => {
-    const ctx = runtimeCtx;
-    try {
-      if (ctx?.hasUI) ctx.ui.notify(message, level);
-    } catch (err) {
-      process.stderr.write(`[pi-relay] notify failed: ${(err as Error).message}\n`);
+function getErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function formatAttachments(attachments: Attachment[]): string {
+  let text = "";
+  for (const att of attachments) {
+    if (att.language) {
+      text += `\n\n---\n📎 ${att.name}\n~~~${att.language}\n${att.content}\n~~~`;
+    } else {
+      text += `\n\n---\n📎 ${att.name}\n${att.content}`;
     }
-    // Always echo to stderr so we have a trail even if the banner is missed.
-    process.stderr.write(`[pi-relay ${level}] ${message}\n`);
-  };
+  }
+  return text;
+}
 
-  const debug = (message: string): void => {
-    if (process.env.PI_RELAY_DEBUG) {
-      process.stderr.write(`[pi-relay debug] ${message}\n`);
-    }
-  };
+function duplicateSessionNames(sessions: SessionInfo[]): Set<string> {
+  return new Set(
+    sessions
+      .map((s) => s.name?.toLowerCase())
+      .filter((name): name is string => Boolean(name))
+      .filter((name, index, names) => names.indexOf(name) !== index),
+  );
+}
 
-  // --------------------------------------------------------------------
-  // Connection management
-  // --------------------------------------------------------------------
+function shortSessionId(sessionId: string): string {
+  return sessionId.slice(0, 8);
+}
 
-  function resolveIdentityName(): string {
-    const sessionName = pi.getSessionName();
-    if (sessionName && sessionName.trim()) return sessionName.trim();
-    if (config?.displayName?.trim()) return config.displayName.trim();
-    // Include a short pid-based suffix so multiple sessions on the same
-    // hostname (very common during local testing) get unique default names.
-    const pidHint = process.pid.toString(36).slice(-3);
-    try {
-      return `${PRESENCE_NAME_FALLBACK}@${hostname()}-${pidHint}`;
-    } catch {
-      return `${PRESENCE_NAME_FALLBACK}-${pidHint}`;
+function formatSessionLabel(session: SessionInfo, duplicates: Set<string>): string {
+  if (!session.name) return session.id;
+  return duplicates.has(session.name.toLowerCase())
+    ? `${session.name} (${shortSessionId(session.id)})`
+    : session.name;
+}
+
+function formatSessionListRow(session: SessionInfo, currentCwd: string, isSelf: boolean): string {
+  const name = session.name || "Unnamed session";
+  const tags = [isSelf ? "self" : session.cwd === currentCwd ? "same cwd" : undefined, session.status]
+    .filter((tag): tag is string => Boolean(tag));
+  const suffix = tags.length ? ` [${tags.join(", ")}]` : "";
+  return `• ${name} (${shortSessionId(session.id)}) — ${session.cwd} (${session.model})${suffix}`;
+}
+
+function previewText(value: unknown, maxLength = 72): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const collapsed = value.replace(/\s+/g, " ").trim();
+  if (!collapsed) return undefined;
+  if (collapsed.length <= maxLength) return collapsed;
+  return `${collapsed.slice(0, maxLength - 1)}…`;
+}
+
+function textResult(text: string): AgentToolResult<unknown> {
+  return { content: [{ type: "text", text }], details: undefined };
+}
+
+function errorToolResult(text: string): AgentToolResult<{ error: true }> {
+  return { content: [{ type: "text", text }], details: { error: true } };
+}
+
+function resolveSessionByQuery(
+  sessions: SessionInfo[],
+  query: string,
+  options: { excludeSelf?: string } = {},
+): { ok: true; session: SessionInfo } | { ok: false; error: string } {
+  const lower = query.toLowerCase();
+  const filterSelf = (s: SessionInfo) =>
+    options.excludeSelf ? s.id !== options.excludeSelf : true;
+
+  // 1. Exact id match.
+  const exact = sessions.find((s) => s.id === query && filterSelf(s));
+  if (exact) return { ok: true, session: exact };
+
+  // 2. Prefix match on id (6+ chars to avoid accidental collision).
+  if (query.length >= 6) {
+    const prefixed = sessions.filter((s) => s.id.startsWith(query) && filterSelf(s));
+    if (prefixed.length === 1) return { ok: true, session: prefixed[0]! };
+    if (prefixed.length > 1) {
+      return { ok: false, error: `Ambiguous id prefix "${query}". Use the full session id.` };
     }
   }
 
-  async function ensureConnected(): Promise<RelayClient> {
-    if (client?.connected) return client;
+  // 3. Name match (case-insensitive, unique).
+  const named = sessions.filter((s) => s.name?.toLowerCase() === lower && filterSelf(s));
+  if (named.length === 1) return { ok: true, session: named[0]! };
+  if (named.length > 1) {
+    return {
+      ok: false,
+      error: `Multiple sessions named "${query}". Use a session id from intercom_list.`,
+    };
+  }
+
+  return { ok: false, error: `No session "${query}" found in current room.` };
+}
+
+export default function piRelayExtension(pi: ExtensionAPI): void {
+  // --- State ---------------------------------------------------------
+  let client: RelayClient | null = null;
+  let config: RelayConfig | null = null;
+  let runtimeContext: ExtensionContext | null = null;
+  let currentSessionId: string | null = null;
+  let currentModel = "unknown";
+  let sessionStartedAt: number | null = null;
+  let shuttingDown = false;
+  let runtimeStarted = false;
+
+  const replyTracker = new ReplyTracker(ASK_TIMEOUT_MS);
+  const pendingIdleMessages: InboundMessageEntry[] = [];
+  let inboundFlushTimer: NodeJS.Timeout | null = null;
+  let replyWaiter:
+    | { from: string; replyTo: string; resolve: (m: Message) => void; reject: (e: Error) => void }
+    | null = null;
+  let agentRunning = false;
+  const activeTools = new Map<string, string>();
+
+  // --- Helpers -------------------------------------------------------
+
+  function ensureConfig(): RelayConfig {
+    if (!config) throw new Error("pi-relay config not loaded yet");
+    return config;
+  }
+
+  function buildPresenceIdentity(): {
+    name: string;
+    cwd: string;
+    model: string;
+    pid: number;
+    startedAt: number;
+    status?: string;
+  } {
+    const piName = pi.getSessionName();
+    const fallback = `${DEFAULT_PRESENCE_NAME}@${(() => {
+      try {
+        return hostname();
+      } catch {
+        return "host";
+      }
+    })()}-${process.pid.toString(36).slice(-3)}`;
+    return {
+      name: piName?.trim() || config?.displayName?.trim() || fallback,
+      cwd: runtimeContext?.cwd ?? process.cwd(),
+      model: currentModel,
+      pid: process.pid,
+      startedAt: sessionStartedAt ?? Date.now(),
+      status: currentStatus(),
+    };
+  }
+
+  function currentStatus(): string {
+    if (activeTools.size > 0) return "tool";
+    if (agentRunning) return "thinking";
+    return "idle";
+  }
+
+  function getLiveContext(ctx: ExtensionContext | null = runtimeContext): ExtensionContext | null {
+    if (shuttingDown || !ctx) return null;
+    try {
+      if (currentSessionId && ctx.sessionManager.getSessionId() !== currentSessionId) return null;
+      void ctx.hasUI;
+      return ctx;
+    } catch {
+      return null;
+    }
+  }
+
+  function notifyIfLive(message: string, level: "info" | "warning" | "error" = "info"): void {
+    const ctx = getLiveContext();
+    process.stderr.write(`[pi-relay ${level}] ${message}\n`);
+    if (!ctx?.hasUI) return;
+    try {
+      ctx.ui.notify(message, level);
+    } catch {
+      // Stale UI; nothing to do.
+    }
+  }
+
+  function syncPresenceIdentity(): void {
+    if (!client?.isConnected()) return;
+    const identity = buildPresenceIdentity();
+    client.updatePresence(identity);
+  }
+
+  async function ensureConnected(reason: "startup" | "tool" | "command"): Promise<RelayClient> {
     if (!config) config = await loadConfig();
     if (config.enabled === false) {
-      throw new Error("pi-relay is disabled in config. Set `enabled: true` to use it.");
+      throw new Error("pi-relay is disabled in config (set `enabled: true` to use).");
     }
+    if (client?.isConnected()) return client;
+
+    if (client) {
+      // Clean up any half-dead instance before creating a new one.
+      try {
+        await client.disconnect();
+      } catch {
+        // ignore
+      }
+      client = null;
+    }
+
+    const identity = buildPresenceIdentity();
     const fresh = new RelayClient({
       url: config.relayUrl,
-      identity: {
-        name: resolveIdentityName(),
-        cwd: runtimeCtx?.cwd,
-        model: runtimeCtx?.model?.id,
-      },
       authCredential: config.authCredential,
-      room: config.room,
+      identity,
     });
-    wireClientEvents(fresh);
+    attachClientHandlers(fresh);
     await fresh.connect();
+    client = fresh;
+
     if (config.room) {
       try {
         await fresh.joinRoom(config.room);
       } catch (err) {
-        notify(`Could not rejoin room ${config.room}: ${(err as Error).message}`, "warning");
+        notifyIfLive(
+          `pi-relay: could not rejoin room ${config.room}: ${getErrorMessage(err)}`,
+          "warning",
+        );
       }
     }
-    client = fresh;
+    if (reason === "startup") {
+      notifyIfLive(
+        `pi-relay connected to ${config.relayUrl}${fresh.room ? ` (room ${fresh.room})` : ""}`,
+      );
+    }
+    syncPresenceIdentity();
     return fresh;
   }
 
-  function wireClientEvents(c: RelayClient): void {
-    c.on("connected", ({ sessionId }: { sessionId: string }) => {
-      notify(`pi-relay connected (session ${sessionId.slice(0, 8)})`, "info");
+  function attachClientHandlers(c: RelayClient): void {
+    c.setInboundMessageFilter((from, message) => {
+      if (!replyWaiter) return false;
+      const senderTarget = from.name || from.id;
+      const fromMatches =
+        senderTarget.toLowerCase() === replyWaiter.from.toLowerCase() || from.id === replyWaiter.from;
+      const replyMatches = message.replyTo === replyWaiter.replyTo;
+      if (fromMatches && replyMatches) {
+        replyWaiter.resolve(message);
+        return true; // consume — don't surface to transcript
+      }
+      return false;
+    });
+
+    c.on("message", (from: SessionInfo, message: Message) => {
+      handleIncomingMessage(from, message);
+    });
+    c.on("session_joined", (peer: SessionInfo) => {
+      notifyIfLive(`pi-relay: ${peer.name ?? shortSessionId(peer.id)} joined the room`);
+    });
+    c.on("session_left", (sessionId: string) => {
+      notifyIfLive(`pi-relay: ${shortSessionId(sessionId)} left the room`);
+    });
+    c.on("presence_update", () => {
+      // Silent — overlay/list reads fresh state on demand.
     });
     c.on("disconnected", () => {
-      notify("pi-relay disconnected; will attempt to reconnect.", "warning");
+      notifyIfLive("pi-relay disconnected; reconnecting…", "warning");
     });
-    c.on("peer_joined", (peer: SessionInfo) => {
-      notify(`pi-relay: ${peer.name ?? peer.id.slice(0, 8)} joined the room`, "info");
+    c.on("error", (err: Error) => {
+      notifyIfLive(`pi-relay error: ${err.message}`, "warning");
     });
-    c.on("peer_left", (
-      ev: { sessionId: string; reason: "left" | "disconnected"; info?: SessionInfo },
-    ) => {
-      const label = ev.info?.name ?? ev.sessionId.slice(0, 8);
-      notify(`pi-relay: ${label} left (${ev.reason})`, "info");
-    });
-    c.on("message", (from: SessionInfo, message: Message) => {
-      surfaceInbound(from, message, false);
-    });
-    c.on("ask", (from: SessionInfo, message: Message) => {
-      surfaceInbound(from, message, true);
-    });
-    c.on("relay_error", (err: { code: string; message: string }) => {
-      notify(`pi-relay error: ${err.code} — ${err.message}`, "error");
+    c.on("room_changed", (ev: { room: string | null; previous: string | null }) => {
+      if (ev.room) {
+        notifyIfLive(`pi-relay: room ${ev.room} active`);
+      } else if (ev.previous) {
+        notifyIfLive(`pi-relay: left room ${ev.previous}`);
+      }
     });
   }
 
-  function surfaceInbound(from: SessionInfo, message: Message, expectsReply: boolean): void {
-    const label = from.name ?? from.id.slice(0, 8);
-    const preview = previewBody(message.content.text, 80);
-    notify(
-      `${expectsReply ? "Ask" : "Message"} from ${label}: ${preview}`,
-      "info",
+  // --- Reply waiter for ask blocking ---------------------------------
+
+  function waitForReply(from: string, replyTo: string, signal?: AbortSignal): Promise<Message> {
+    if (replyWaiter) return Promise.reject(new Error("Already waiting for a reply"));
+    if (signal?.aborted) return Promise.reject(new Error("Cancelled"));
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        rejectReplyWaiter(new Error(`No reply from "${from}" within ${ASK_TIMEOUT_MS / 60_000} minutes`));
+      }, ASK_TIMEOUT_MS);
+      const cleanup = () => {
+        clearTimeout(timeout);
+        signal?.removeEventListener("abort", onAbort);
+        if (replyWaiter?.replyTo === replyTo) replyWaiter = null;
+      };
+      const onAbort = () => {
+        cleanup();
+        reject(new Error("Cancelled"));
+      };
+      signal?.addEventListener("abort", onAbort, { once: true });
+      replyWaiter = {
+        from,
+        replyTo,
+        resolve: (message) => {
+          cleanup();
+          resolve(message);
+        },
+        reject: (error) => {
+          cleanup();
+          reject(error);
+        },
+      };
+    });
+  }
+
+  function rejectReplyWaiter(error: Error): void {
+    replyWaiter?.reject(error);
+  }
+
+  // --- Inbound flush queue (idle-aware) ------------------------------
+
+  function clearInboundFlushTimer(): void {
+    if (!inboundFlushTimer) return;
+    clearTimeout(inboundFlushTimer);
+    inboundFlushTimer = null;
+  }
+
+  function sendIncomingMessage(entry: InboundMessageEntry, delivery: "trigger" | "followUp"): void {
+    if (runtimeStarted && !getLiveContext()) return;
+    if (delivery !== "followUp") {
+      replyTracker.queueTurnContext({ from: entry.from, message: entry.message, receivedAt: Date.now() });
+    }
+    const senderDisplay = entry.from.name || shortSessionId(entry.from.id);
+    const replyInstruction = entry.replyCommand
+      ? `\n\nTo reply, use the intercom tool: ${entry.replyCommand}`
+      : "";
+    pi.sendMessage(
+      {
+        customType: "pi_relay_message",
+        content: `**📨 From ${senderDisplay}** (${entry.from.cwd})${replyInstruction}\n\n${entry.bodyText}`,
+        display: true,
+        details: entry,
+      },
+      delivery === "trigger" ? { triggerTurn: true } : { deliverAs: "followUp" },
     );
-    const details: InlineMessageDetails = {
-      from,
-      message,
-      expectsReply,
-      replyCommand: expectsReply
-        ? `intercom_reply (to "${from.id}" requestId "${message.id}")`
-        : undefined,
-    };
-    pi.sendMessage({
-      customType: "pi_relay_message",
-      content: `${expectsReply ? "ask" : "msg"} from ${label}: ${preview}`,
-      display: true,
-      details,
+  }
+
+  function scheduleInboundFlush(delayMs = INBOUND_FLUSH_DELAY_MS): void {
+    if (!getLiveContext()) return;
+    clearInboundFlushTimer();
+    inboundFlushTimer = setTimeout(() => {
+      inboundFlushTimer = null;
+      flushIdleMessages();
+    }, delayMs);
+  }
+
+  function flushIdleMessages(): void {
+    if (pendingIdleMessages.length === 0) return;
+    const ctx = getLiveContext();
+    if (!ctx) return;
+    let isIdle: boolean;
+    try {
+      isIdle = ctx.isIdle();
+    } catch {
+      return;
+    }
+    if (!isIdle) {
+      scheduleInboundFlush(INBOUND_IDLE_RETRY_MS);
+      return;
+    }
+    const entries = pendingIdleMessages.splice(0, pendingIdleMessages.length);
+    entries.forEach((entry, index) => {
+      sendIncomingMessage(entry, index === 0 ? "trigger" : "followUp");
     });
   }
 
-  function previewBody(text: string, max: number): string {
-    const flat = text.replace(/\s+/g, " ").trim();
-    if (flat.length <= max) return flat;
-    return flat.slice(0, max - 1) + "…";
+  function queueIdleMessage(entry: InboundMessageEntry): void {
+    pendingIdleMessages.push(entry);
+    scheduleInboundFlush();
   }
 
-  function requireConnected(): RelayClient {
-    if (!client?.connected) {
-      throw new Error("pi-relay not connected. Run `/intercom join <code>` or `/intercom new`.");
-    }
-    return client;
-  }
+  function handleIncomingMessage(from: SessionInfo, message: Message): void {
+    const ctx = getLiveContext();
+    if (!ctx) return;
+    // Reply-waiter already handled in setInboundMessageFilter — those messages
+    // never reach us here.
+    const attachmentText = message.content.attachments?.length
+      ? formatAttachments(message.content.attachments)
+      : "";
+    const bodyText = `${message.content.text}${attachmentText}`;
+    const replyCommand = message.expectsReply
+      ? `intercom({ action: "reply", message: "..." })`
+      : undefined;
+    replyTracker.recordIncomingMessage(from, message);
+    const entry: InboundMessageEntry = { from, message, bodyText, ...(replyCommand ? { replyCommand } : {}) };
 
-  function findPeerByIdOrName(c: RelayClient, query: string): SessionInfo | undefined {
-    const peers = c.listSessions();
-    // 1. Exact session id match.
-    const exact = peers.find((p) => p.id === query);
-    if (exact) return exact;
-    // 2. Prefix match on session id (require at least 6 chars to keep collisions rare).
-    if (query.length >= 6) {
-      const prefixed = peers.filter((p) => p.id.startsWith(query));
-      if (prefixed.length === 1) return prefixed[0];
-      if (prefixed.length > 1) {
-        throw new Error(
-          `Ambiguous session-id prefix "${query}". Use the full id from intercom_list.`,
-        );
-      }
-    }
-    // 3. Exact name match (case-insensitive).
-    const named = peers.filter((p) => p.name?.toLowerCase() === query.toLowerCase());
-    if (named.length === 1) return named[0];
-    if (named.length > 1) {
-      throw new Error(
-        `Multiple peers named "${query}". Use a session id from intercom_list (the long uuid).`,
-      );
-    }
-    return undefined;
-  }
-
-  function textResult(text: string): AgentToolResult<unknown> {
-    return { content: [{ type: "text", text }], details: undefined };
-  }
-
-  // --------------------------------------------------------------------
-  // Lifecycle hooks
-  // --------------------------------------------------------------------
-
-  pi.on("session_start", async (_event, ctx) => {
-    runtimeCtx = ctx;
-    debug("session_start fired");
-    try {
-      config = await loadConfig();
-      debug(`config loaded: ${JSON.stringify(config)}`);
-    } catch (err) {
-      notify(`pi-relay config error: ${(err as Error).message}`, "error");
-      return;
-    }
-    if (config.enabled === false) {
-      debug("pi-relay disabled in config; skipping connect");
-      return;
-    }
-    try {
-      await ensureConnected();
-    } catch (err) {
-      notify(`pi-relay could not connect: ${(err as Error).message}`, "warning");
-    }
-  });
-
-  pi.on("session_shutdown", async () => {
-    if (client) {
+    void (async () => {
+      const activeContext = getLiveContext();
+      if (!activeContext) return;
+      let isIdle: boolean;
       try {
-        await client.disconnect();
+        isIdle = activeContext.isIdle();
       } catch {
-        // ignore — process is exiting
+        return;
       }
-      client = null;
+      if (!isIdle) {
+        if (!activeContext.hasUI) {
+          // Print/RPC mode + busy → auto-reply with the canned "I'm non-interactive" note.
+          const activeClient = client;
+          if (!message.replyTo && activeClient?.isConnected()) {
+            try {
+              const result = await activeClient.send(from.id, {
+                text: NON_INTERACTIVE_BUSY_REPLY,
+                replyTo: message.id,
+              });
+              if (result.delivered && getLiveContext()) {
+                replyTracker.markReplied(message.id);
+              }
+            } catch {
+              // Best-effort — keep the busy non-interactive session running either way.
+            }
+          }
+          return;
+        }
+        queueIdleMessage(entry);
+        return;
+      }
+      if (getLiveContext()) sendIncomingMessage(entry, "trigger");
+    })();
+  }
+
+  // --- Overlay --------------------------------------------------------
+
+  async function openIntercomOverlay(ctx: ExtensionCommandContext): Promise<void> {
+    if (!ctx.hasUI) {
+      notifyIfLive("pi-relay overlay only available in interactive mode", "warning");
+      return;
     }
-  });
+    let c: RelayClient;
+    try {
+      c = await ensureConnected("command");
+    } catch (err) {
+      notifyIfLive(`pi-relay unavailable: ${getErrorMessage(err)}`, "error");
+      return;
+    }
+    syncPresenceIdentity();
+    if (!c.room) {
+      notifyIfLive(
+        "pi-relay: not in a room. Use `/intercom new` to create one or `/intercom join <code>` to join.",
+        "warning",
+      );
+      return;
+    }
 
-  // --------------------------------------------------------------------
-  // Tools (LLM-callable)
-  // --------------------------------------------------------------------
+    const sessions = await c.listSessions();
+    const selfId = c.sessionId;
+    const selfSession =
+      sessions.find((s) => s.id === selfId) ??
+      ({
+        id: selfId ?? "",
+        cwd: ctx.cwd,
+        model: currentModel,
+        pid: process.pid,
+        startedAt: sessionStartedAt ?? Date.now(),
+        lastActivity: Date.now(),
+        name: buildPresenceIdentity().name,
+      } as SessionInfo);
+
+    const others = sessions.filter((s) => s.id !== selfId);
+    const selectedSession = await ctx.ui.custom<SessionInfo | undefined>(
+      (_tui, theme, keybindings, done) => new SessionListOverlay(theme, keybindings, selfSession, others, done),
+      { overlay: true },
+    );
+    if (!selectedSession) return;
+
+    const duplicates = duplicateSessionNames(sessions);
+    const targetLabel = formatSessionLabel(selectedSession, duplicates);
+    const composeResult = await ctx.ui.custom<ComposeResult>(
+      (tui, theme, keybindings, done) =>
+        new ComposeOverlay(tui, theme, keybindings, selectedSession, targetLabel, c, done),
+      { overlay: true },
+    );
+    if (composeResult.sent) {
+      notifyIfLive(`pi-relay: message sent to ${targetLabel}`);
+    }
+  }
+
+  // --- The single `intercom` tool ------------------------------------
 
   pi.registerTool({
-    name: "intercom_send",
-    label: "Intercom Send",
-    description: "Send a fire-and-forget message to another pi session in the current pi-relay room. Use this when you want to share information without expecting a structured reply.",
-    promptSnippet: "Send a one-way message to another pi session via pi-relay.",
+    name: "intercom",
+    label: "Intercom",
+    description: `Communicate with another pi session in the current pi-relay room.
+
+Usage:
+  intercom({ action: "list" })                                    → List peers in current room
+  intercom({ action: "send", to: "session-id", message: "..." })  → Fire-and-forget message
+  intercom({ action: "ask",  to: "session-id", message: "..." })  → Ask and wait for reply
+  intercom({ action: "reply", message: "..." })                    → Reply to the active/single pending ask
+  intercom({ action: "pending" })                                   → List unresolved inbound asks
+  intercom({ action: "status" })                                    → Show connection / room status
+  intercom({ action: "new" })                                       → Create a new room (returns code)
+  intercom({ action: "join", to: "ABC-234" })                       → Join an existing room by code
+  intercom({ action: "leave" })                                     → Leave the current room`,
+    promptSnippet:
+      "Use to coordinate with another pi session across machines via pi-relay: list peers, send updates, ask for help, or check connectivity.",
     parameters: Type.Object({
-      to: Type.String({ description: "Recipient session id (uuid from intercom_list). A 6+ char prefix is also accepted if unambiguous." }),
-      message: Type.String({ description: "Plain-text body of the message." }),
+      action: Type.String({
+        description:
+          "'list' | 'send' | 'ask' | 'reply' | 'pending' | 'status' | 'new' | 'join' | 'leave'",
+      }),
+      to: Type.Optional(
+        Type.String({
+          description:
+            "Target session id/name (send, ask, disambiguating reply) OR room code (join). Full uuid or 6+ char prefix.",
+        }),
+      ),
+      message: Type.Optional(Type.String({ description: "Message body (for send / ask / reply)." })),
+      attachments: Type.Optional(
+        Type.Array(
+          Type.Object({
+            type: Type.Union([Type.Literal("file"), Type.Literal("snippet"), Type.Literal("context")]),
+            name: Type.String(),
+            content: Type.String(),
+            language: Type.Optional(Type.String()),
+          }),
+        ),
+      ),
+      replyTo: Type.Optional(
+        Type.String({ description: "Message ID to reply to (threading)." }),
+      ),
     }),
-    async execute(_id, params) {
+
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+      runtimeContext = ctx;
+      currentSessionId = ctx.sessionManager.getSessionId();
+
+      let activeClient: RelayClient;
       try {
-        const c = requireConnected();
-        const peer = findPeerByIdOrName(c, params.to);
-        if (!peer) return textResult(`No peer "${params.to}" in current room.`);
-        const result = await c.send(peer.id, { text: params.message });
-        return textResult(`Sent to ${peer.name ?? peer.id}: ${"delivered" in result ? "delivered" : "queued"}`);
+        activeClient = await ensureConnected("tool");
       } catch (err) {
-        return textResult((err as Error).message);
+        return errorToolResult(`pi-relay not connected: ${getErrorMessage(err)}`);
       }
-    },
-  });
+      syncPresenceIdentity();
 
-  pi.registerTool({
-    name: "intercom_ask",
-    label: "Intercom Ask",
-    description: "Send a question to another pi session and block until they reply, with a 10-minute timeout. Use this when you need a structured answer to continue your work.",
-    promptSnippet: "Ask another pi session a question and wait for their reply.",
-    parameters: Type.Object({
-      to: Type.String({ description: "Recipient session id (uuid from intercom_list). A 6+ char prefix is also accepted if unambiguous." }),
-      question: Type.String({ description: "The question to ask." }),
-      timeoutMinutes: Type.Optional(Type.Number({
-        description: "Timeout in minutes. Defaults to 10. Maximum 60.",
-        minimum: 1,
-        maximum: 60,
-      })),
-    }),
-    async execute(_id, params, signal) {
+      const action = String(params.action).toLowerCase();
+
       try {
-        const c = requireConnected();
-        const peer = findPeerByIdOrName(c, params.to);
-        if (!peer) return textResult(`No peer "${params.to}" in current room.`);
-        const askTimeoutMs = (params.timeoutMinutes ?? 10) * 60 * 1000;
-        const onAbort = () => {
-          // Reply timeout/abort handled inside RelayClient.send via promise rejection
-        };
-        signal?.addEventListener("abort", onAbort, { once: true });
-        try {
-          const reply = (await c.send(peer.id, {
-            text: params.question,
-            expectsReply: true,
-            askTimeoutMs,
-          })) as Message;
-          return textResult(`${peer.name ?? peer.id}: ${reply.content.text}`);
-        } finally {
-          signal?.removeEventListener("abort", onAbort);
+        switch (action) {
+          case "list":
+            return handleList(activeClient);
+          case "pending":
+            return handlePending();
+          case "status":
+            return handleStatus(activeClient);
+          case "new":
+            return await handleNew(activeClient);
+          case "join":
+            return await handleJoin(activeClient, params.to);
+          case "leave":
+            return handleLeave(activeClient);
+          case "send":
+            return await handleSend(activeClient, params, signal);
+          case "ask":
+            return await handleAsk(activeClient, params, signal);
+          case "reply":
+            return await handleReply(activeClient, params);
+          default:
+            return errorToolResult(
+              `Unknown action "${params.action}". Use one of: list, send, ask, reply, pending, status, new, join, leave.`,
+            );
         }
       } catch (err) {
-        return textResult((err as Error).message);
+        return errorToolResult(`intercom ${action} failed: ${getErrorMessage(err)}`);
       }
     },
   });
 
-  pi.registerTool({
-    name: "intercom_reply",
-    label: "Intercom Reply",
-    description: "Reply to a pending ask from another pi session. Use this after intercom_pending shows an unanswered question directed at you.",
-    promptSnippet: "Reply to a pending ask from another pi session.",
-    parameters: Type.Object({
-      to: Type.String({ description: "Original asker's session id." }),
-      requestId: Type.String({ description: "Message id of the ask being answered (from intercom_pending)." }),
-      message: Type.String({ description: "Reply body." }),
-    }),
-    async execute(_id, params) {
-      try {
-        const c = requireConnected();
-        const peer = findPeerByIdOrName(c, params.to);
-        if (!peer) return textResult(`No peer "${params.to}" in current room.`);
-        await c.send(peer.id, { text: params.message, replyTo: params.requestId });
-        return textResult(`Replied to ${peer.name ?? peer.id}`);
-      } catch (err) {
-        return textResult((err as Error).message);
-      }
-    },
-  });
+  function handleList(c: RelayClient): AgentToolResult<unknown> {
+    const sessions = [...listSessionsFromClient(c)];
+    if (sessions.length === 0) {
+      return textResult(c.room ? `Room ${c.room}: no peers yet.` : "Not in a room.");
+    }
+    const lines = sessions.map((s) =>
+      formatSessionListRow(s, runtimeContext?.cwd ?? process.cwd(), s.id === c.sessionId),
+    );
+    return textResult(
+      `Room ${c.room ?? "(none)"} (${sessions.length} session${sessions.length === 1 ? "" : "s"}):\n${lines.join("\n")}\n\nUse the long id (uuid) — or a unique 6+ char prefix — as the \`to\` parameter for send / ask.`,
+    );
+  }
 
-  pi.registerTool({
-    name: "intercom_list",
-    label: "Intercom List",
-    description: "List all pi sessions in the current pi-relay room, including self.",
-    promptSnippet: "List peers in the current pi-relay room.",
-    parameters: Type.Object({}),
-    async execute() {
-      try {
-        const c = requireConnected();
-        const peers = c.listSessions();
-        if (peers.length === 0) return textResult("No peers in room (or not in a room yet).");
-        const lines = peers.map((p) => {
-          const tags: string[] = [];
-          if (p.id === c.sessionId) tags.push("self");
-          if (p.status) tags.push(p.status);
-          const tagSuffix = tags.length ? ` [${tags.join(", ")}]` : "";
-          const meta = [p.cwd, p.model].filter(Boolean).join(" • ");
-          const metaLine = meta ? `\n    ${meta}` : "";
-          return `- id: ${p.id}${tagSuffix}\n    name: ${p.name ?? "(unnamed)"}${metaLine}`;
-        });
-        return textResult(
-          `Room ${c.room} (${peers.length} peer${peers.length === 1 ? "" : "s"}):\n${lines.join("\n")}\n\nUse the full \`id\` (uuid) as the \`to\` parameter in intercom_send / intercom_ask / intercom_reply.`,
-        );
-      } catch (err) {
-        return textResult((err as Error).message);
-      }
-    },
-  });
+  function handlePending(): AgentToolResult<unknown> {
+    const pending = replyTracker.listPending();
+    if (pending.length === 0) return textResult("No pending asks.");
+    const lines = pending.map((p) => {
+      const elapsed = Math.round((Date.now() - p.receivedAt) / 1000);
+      const preview = previewText(p.message.content.text, 200) ?? "(no body)";
+      return `- from ${p.from.name ?? p.from.id} (id ${shortSessionId(p.from.id)}) | requestId ${p.message.id} | ${elapsed}s ago\n    ${preview}`;
+    });
+    return textResult(lines.join("\n"));
+  }
 
-  pi.registerTool({
-    name: "intercom_pending",
-    label: "Intercom Pending",
-    description: "List inbound asks from other pi sessions that have not yet been answered. Use this to find questions you need to reply to.",
-    promptSnippet: "List unanswered asks from other pi sessions.",
-    parameters: Type.Object({}),
-    async execute() {
-      try {
-        const c = requireConnected();
-        const pending = c.listPendingAsks();
-        if (pending.length === 0) return textResult("No pending asks.");
-        const lines = pending.map((p) => {
-          const elapsed = Math.round((Date.now() - p.receivedAt) / 1000);
-          return `- from ${p.from.name ?? p.from.id} (id ${p.from.id.slice(0, 8)}) | requestId ${p.message.id} | ${elapsed}s ago\n    ${previewBody(p.message.content.text, 200)}`;
-        });
-        return textResult(lines.join("\n"));
-      } catch (err) {
-        return textResult((err as Error).message);
-      }
-    },
-  });
+  function handleStatus(c: RelayClient): AgentToolResult<unknown> {
+    const cfg = ensureConfig();
+    const peerCount = c.isConnected() ? [...listSessionsFromClient(c)].length : 0;
+    return textResult(
+      [
+        c.isConnected() ? "pi-relay: connected" : "pi-relay: disconnected",
+        `  relay: ${cfg.relayUrl}`,
+        `  session: ${c.sessionId ?? "(none)"}`,
+        `  room: ${c.room ?? "(none)"}`,
+        `  peers: ${peerCount}`,
+      ].join("\n"),
+    );
+  }
 
-  pi.registerTool({
-    name: "intercom_status",
-    label: "Intercom Status",
-    description: "Report pi-relay connection state, current room code, and own session id.",
-    promptSnippet: "Report pi-relay connection state and current room.",
-    parameters: Type.Object({}),
-    async execute() {
-      const cfg = config ?? (await loadConfig());
-      if (!client?.connected) {
-        return textResult(`pi-relay: disconnected. Relay URL: ${cfg.relayUrl}`);
-      }
-      const room = client.room ?? "(no room)";
-      const peers = client.listSessions().length;
-      return textResult(
-        `pi-relay: connected\n  session: ${client.sessionId}\n  room: ${room}\n  peers: ${peers}\n  relay: ${cfg.relayUrl}`,
-      );
-    },
-  });
+  async function handleNew(c: RelayClient): Promise<AgentToolResult<unknown>> {
+    if (c.room) {
+      return errorToolResult(`Already in room ${c.room}. Leave first with intercom({ action: "leave" }).`);
+    }
+    const code = await c.createRoom();
+    await updateConfig({ room: code });
+    if (config) config.room = code;
+    return textResult(`pi-relay room created: ${code}. Share this code with the other pi session.`);
+  }
 
-  // --------------------------------------------------------------------
-  // /intercom slash command
-  // --------------------------------------------------------------------
+  async function handleJoin(c: RelayClient, to: unknown): Promise<AgentToolResult<unknown>> {
+    if (typeof to !== "string" || !to.trim()) {
+      return errorToolResult('Missing room code. Use intercom({ action: "join", to: "ABC-234" }).');
+    }
+    if (c.room) {
+      c.leaveRoom();
+    }
+    await c.joinRoom(to.trim());
+    await updateConfig({ room: c.room ?? undefined });
+    if (config) config.room = c.room ?? undefined;
+    return textResult(`Joined pi-relay room ${c.room}.`);
+  }
+
+  function handleLeave(c: RelayClient): AgentToolResult<unknown> {
+    if (!c.room) return textResult("pi-relay: not in a room.");
+    const prev = c.room;
+    c.leaveRoom();
+    void updateConfig({ room: undefined });
+    if (config) config.room = undefined;
+    return textResult(`Left pi-relay room ${prev}.`);
+  }
+
+  async function handleSend(
+    c: RelayClient,
+    params: { to?: string; message?: string; attachments?: Attachment[]; replyTo?: string },
+    _signal: AbortSignal | undefined,
+  ): Promise<AgentToolResult<unknown>> {
+    if (!params.to) return errorToolResult("Missing `to` for send.");
+    if (!params.message || !params.message.trim()) return errorToolResult("Missing `message` for send.");
+    const resolved = resolveSessionByQuery([...listSessionsFromClient(c)], params.to, {
+      excludeSelf: c.sessionId ?? undefined,
+    });
+    if (!resolved.ok) return errorToolResult(resolved.error);
+    const result = await c.send(resolved.session.id, {
+      text: params.message,
+      attachments: params.attachments,
+      replyTo: params.replyTo,
+    });
+    if (!result.delivered) {
+      return errorToolResult(`Message not delivered: ${result.reason ?? "unknown reason"}`);
+    }
+    return textResult(`Sent to ${resolved.session.name ?? resolved.session.id} (message id ${result.id}).`);
+  }
+
+  async function handleAsk(
+    c: RelayClient,
+    params: { to?: string; message?: string; attachments?: Attachment[] },
+    signal: AbortSignal | undefined,
+  ): Promise<AgentToolResult<unknown>> {
+    if (!params.to) return errorToolResult("Missing `to` for ask.");
+    if (!params.message || !params.message.trim()) return errorToolResult("Missing `message` for ask.");
+    if (replyWaiter) return errorToolResult("Already waiting for a reply to a previous ask.");
+    const resolved = resolveSessionByQuery([...listSessionsFromClient(c)], params.to, {
+      excludeSelf: c.sessionId ?? undefined,
+    });
+    if (!resolved.ok) return errorToolResult(resolved.error);
+    const messageId = randomUUID();
+    const sendResult = await c.send(resolved.session.id, {
+      text: params.message,
+      attachments: params.attachments,
+      expectsReply: true,
+      messageId,
+    });
+    if (!sendResult.delivered) {
+      return errorToolResult(`Ask not delivered: ${sendResult.reason ?? "unknown reason"}`);
+    }
+    try {
+      const reply = await waitForReply(resolved.session.id, messageId, signal);
+      const replyText =
+        reply.content.text +
+        (reply.content.attachments?.length ? formatAttachments(reply.content.attachments) : "");
+      return textResult(`${resolved.session.name ?? resolved.session.id} replied:\n\n${replyText}`);
+    } catch (err) {
+      return errorToolResult(getErrorMessage(err));
+    }
+  }
+
+  async function handleReply(
+    c: RelayClient,
+    params: { to?: string; message?: string; attachments?: Attachment[] },
+  ): Promise<AgentToolResult<unknown>> {
+    if (!params.message || !params.message.trim()) return errorToolResult("Missing `message` for reply.");
+    let context;
+    try {
+      context = replyTracker.resolveReplyTarget({ to: params.to });
+    } catch (err) {
+      return errorToolResult(getErrorMessage(err));
+    }
+    const result = await c.send(context.from.id, {
+      text: params.message,
+      attachments: params.attachments,
+      replyTo: context.message.id,
+    });
+    if (!result.delivered) {
+      return errorToolResult(`Reply not delivered: ${result.reason ?? "unknown reason"}`);
+    }
+    replyTracker.markReplied(context.message.id);
+    return textResult(`Replied to ${context.from.name ?? context.from.id}.`);
+  }
+
+  function* listSessionsFromClient(c: RelayClient): IterableIterator<SessionInfo> {
+    // Synchronous read from the local cache that the client maintains.
+    // Using the same indirection so we don't need to await Promise in tool handlers.
+    for (const s of (c as unknown as { peers: Map<string, SessionInfo> }).peers.values()) {
+      yield s;
+    }
+  }
+
+  // --- Slash command & shortcut -------------------------------------
 
   pi.registerCommand("intercom", {
-    description: "Manage pi-relay room: /intercom new | join <code> | leave | status | overlay",
+    description: "Open pi-relay session intercom",
     handler: async (args, ctx) => {
-      // Refresh runtime context — pi may issue a fresh ctx per command call.
-      runtimeCtx = ctx;
-      const cmdCtx = ctx as ExtensionCommandContext;
+      runtimeContext = ctx;
       const tokens = args.trim().split(/\s+/).filter(Boolean);
-      const sub = tokens[0]?.toLowerCase() ?? "overlay";
-      debug(`/intercom received args=${JSON.stringify(args)} sub=${sub}`);
+      const sub = tokens[0]?.toLowerCase();
 
+      // Bare `/intercom` mirrors pi-intercom: open the overlay.
+      if (!sub) {
+        await openIntercomOverlay(ctx);
+        return;
+      }
+
+      // Convenience aliases for room operations — call the tool actions directly.
       try {
+        const c = await ensureConnected("command");
         if (sub === "new") {
-          notify("pi-relay: creating room…", "info");
-          const c = await ensureConnected();
-          debug(`creating room, sessionId=${c.sessionId}, connected=${c.connected}`);
-          const code = await c.createRoom();
-          await updateConfig({ room: code });
-          if (config) config.room = code;
-          notify(`pi-relay room created: ${code} (share this with the other side)`, "info");
+          const result = await handleNew(c);
+          notifyIfLive(textOf(result));
           return;
         }
         if (sub === "join") {
           const code = tokens[1];
           if (!code) {
-            notify("Usage: /intercom join <room-code>  (e.g. /intercom join ABC-234)", "warning");
+            notifyIfLive("Usage: /intercom join <room-code>", "warning");
             return;
           }
-          notify(`pi-relay: joining room ${code}…`, "info");
-          const c = await ensureConnected();
-          await c.joinRoom(code);
-          await updateConfig({ room: code });
-          if (config) config.room = code;
-          notify(`pi-relay joined ${code}`, "info");
+          const result = await handleJoin(c, code);
+          notifyIfLive(textOf(result));
           return;
         }
         if (sub === "leave") {
-          if (!client?.connected || !client.room) {
-            notify("pi-relay: not in a room", "warning");
-            return;
-          }
-          client.leaveRoom();
-          await updateConfig({ room: undefined });
-          if (config) config.room = undefined;
-          notify("pi-relay: left room", "info");
+          const result = handleLeave(c);
+          notifyIfLive(textOf(result));
           return;
         }
         if (sub === "status") {
-          const cfg = config ?? (await loadConfig());
-          if (!client?.connected) {
-            notify(`pi-relay: disconnected (relay ${cfg.relayUrl})`, "warning");
-            return;
-          }
-          notify(
-            `pi-relay: connected to ${cfg.relayUrl} • room ${client.room ?? "(none)"} • ${client.listSessions().length} peer(s)`,
-            "info",
-          );
+          const result = handleStatus(c);
+          notifyIfLive(textOf(result));
           return;
         }
-        if (sub === "overlay" || sub === "") {
-          await openIntercomOverlay(cmdCtx);
+        if (sub === "list") {
+          const result = handleList(c);
+          notifyIfLive(textOf(result));
           return;
         }
-        notify(`Unknown /intercom subcommand: ${sub}. Try: new, join, leave, status, overlay`, "warning");
+        if (sub === "overlay") {
+          await openIntercomOverlay(ctx);
+          return;
+        }
+        notifyIfLive(
+          `Unknown /intercom subcommand: ${sub}. Try: new, join, leave, status, list, overlay (or bare /intercom).`,
+          "warning",
+        );
       } catch (err) {
-        notify(`/intercom ${sub} failed: ${(err as Error).message}`, "error");
-        process.stderr.write(`[pi-relay] /intercom ${sub} error stack: ${(err as Error).stack ?? ""}\n`);
+        notifyIfLive(`/intercom ${sub} failed: ${getErrorMessage(err)}`, "error");
       }
     },
   });
 
-  async function openIntercomOverlay(ctx: ExtensionContext): Promise<void> {
-    try {
-      const c = await ensureConnected();
-      await openSessionListOverlay(ctx, c);
-    } catch (err) {
-      notify(`pi-relay overlay: ${(err as Error).message}`, "error");
-    }
+  function textOf(result: AgentToolResult<unknown>): string {
+    const first = result.content[0];
+    return first && first.type === "text" ? first.text : "(no text)";
   }
 
   pi.registerShortcut("alt+m", {
-    description: "Open pi-relay session list",
-    handler: async (ctx) => openIntercomOverlay(ctx),
+    description: "Open pi-relay session intercom",
+    handler: async (ctx) => openIntercomOverlay(ctx as ExtensionCommandContext),
   });
 
-  // --------------------------------------------------------------------
-  // Inline renderer for incoming peer messages
-  // --------------------------------------------------------------------
+  // --- Inline message renderer --------------------------------------
 
-  pi.registerMessageRenderer<InlineMessageDetails>(
-    "pi_relay_message",
-    (message, _options, theme) => {
-      if (!message.details) return undefined;
-      return new InlineMessageComponent(message.details, theme);
-    },
-  );
+  pi.registerMessageRenderer<InboundMessageEntry>("pi_relay_message", (message, _options, theme) => {
+    const details = message.details;
+    if (!details) return undefined;
+    return new InlineMessageComponent(
+      details.from,
+      details.message,
+      theme,
+      details.replyCommand,
+      details.bodyText,
+    );
+  });
 
-  // Stable internal id helper so other modules can mint correlation ids.
-  void randomUUID;
+  // --- Lifecycle hooks ----------------------------------------------
+
+  pi.on("session_start", async (_event, ctx) => {
+    runtimeContext = ctx;
+    currentSessionId = ctx.sessionManager.getSessionId();
+    sessionStartedAt = Date.now();
+    runtimeStarted = true;
+    shuttingDown = false;
+    if (ctx.model) currentModel = ctx.model.id;
+    try {
+      config = await loadConfig();
+    } catch (err) {
+      notifyIfLive(`pi-relay config error: ${getErrorMessage(err)}`, "error");
+      return;
+    }
+    if (config.enabled === false) return;
+    try {
+      await ensureConnected("startup");
+    } catch (err) {
+      notifyIfLive(`pi-relay could not connect: ${getErrorMessage(err)}`, "warning");
+    }
+  });
+
+  pi.on("session_shutdown", async () => {
+    shuttingDown = true;
+    clearInboundFlushTimer();
+    rejectReplyWaiter(new Error("Session shutting down"));
+    if (client) {
+      try {
+        await client.disconnect();
+      } catch {
+        // ignore
+      }
+      client = null;
+    }
+  });
+
+  pi.on("turn_start", (_event, ctx) => {
+    runtimeContext = ctx;
+    replyTracker.beginTurn();
+  });
+
+  pi.on("turn_end", () => {
+    replyTracker.endTurn();
+    // If anything queued while busy, give it a nudge — flushIdleMessages will
+    // bail if we're still streaming.
+    scheduleInboundFlush(0);
+  });
+
+  pi.on("agent_start", () => {
+    agentRunning = true;
+    syncPresenceIdentity();
+  });
+
+  pi.on("agent_end", () => {
+    agentRunning = false;
+    syncPresenceIdentity();
+    scheduleInboundFlush(0);
+  });
+
+  pi.on("tool_execution_start", (event) => {
+    activeTools.set(event.toolCallId, event.toolName);
+    syncPresenceIdentity();
+  });
+
+  pi.on("tool_execution_end", (event) => {
+    activeTools.delete(event.toolCallId);
+    syncPresenceIdentity();
+  });
+
+  pi.on("model_select", (event) => {
+    currentModel = event.model.id;
+    syncPresenceIdentity();
+  });
 }

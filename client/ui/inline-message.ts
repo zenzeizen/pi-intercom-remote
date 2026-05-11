@@ -1,77 +1,76 @@
-/**
- * Renders an inbound pi-relay peer message as a bordered inline component
- * in the pi transcript. Shown for both fire-and-forget messages and asks
- * (asks include a reply hint in the footer).
- */
-
 import type { Component } from "@earendil-works/pi-tui";
 import { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import type { Theme } from "@earendil-works/pi-coding-agent";
-import type { Message, SessionInfo } from "../types.ts";
-
-export interface InlineMessageDetails {
-  from: SessionInfo;
-  message: Message;
-  expectsReply: boolean;
-  /** Optional human-readable hint at the bottom of the box for how to reply. */
-  replyCommand?: string;
-}
+import type { SessionInfo, Message } from "../types.ts";
 
 export class InlineMessageComponent implements Component {
-  constructor(
-    private readonly details: InlineMessageDetails,
-    private readonly theme: Theme,
-  ) {}
+  private from: SessionInfo;
+  private message: Message;
+  private theme: Theme;
+  private replyCommand?: string;
+  private bodyText?: string;
+
+  constructor(from: SessionInfo, message: Message, theme: Theme, replyCommand?: string, bodyText?: string) {
+    this.from = from;
+    this.message = message;
+    this.theme = theme;
+    this.replyCommand = replyCommand;
+    this.bodyText = bodyText;
+  }
 
   invalidate(): void {}
 
   render(width: number): string[] {
-    const { from, message, expectsReply, replyCommand } = this.details;
+    const lines: string[] = [];
+    const borderChar = "─";
     if (width < 3) {
-      return [truncateToWidth(`From ${from.name ?? from.id.slice(0, 8)}`, width)];
+      return [truncateToWidth(`From ${this.from.name || this.from.id.slice(0, 8)}`, width)];
     }
     const bodyWidth = Math.max(1, width - 2);
-    const accent = (text: string) => this.theme.fg("accent", text);
-    const dim = (text: string) => this.theme.fg("dim", text);
 
-    const row = (text = ""): string => {
-      const clipped = truncateToWidth(text, bodyWidth, "");
-      const padding = " ".repeat(Math.max(0, bodyWidth - visibleWidth(clipped)));
-      return accent(`│${clipped}${padding}│`);
-    };
-
-    const senderName = from.name ?? from.id.slice(0, 8);
-    const icon = expectsReply ? "❓" : "📨";
-    const header = ` ${icon} ${expectsReply ? "Ask" : "Message"} from: ${senderName} `;
+    const senderName = this.from.name || this.from.id.slice(0, 8);
+    const header = ` 📨 From: ${senderName} (${this.from.cwd}) `;
     const headerText = truncateToWidth(header, bodyWidth, "");
-    const headerPadding = "─".repeat(Math.max(0, bodyWidth - visibleWidth(headerText)));
-    const lines: string[] = [];
-    lines.push(accent(`╭${headerText}${headerPadding}╮`));
+    const headerPadding = Math.max(0, bodyWidth - visibleWidth(headerText));
+    lines.push(this.theme.fg("accent", `╭${headerText}${borderChar.repeat(headerPadding)}╮`));
 
-    for (const line of wrapTextWithAnsi(message.content.text, bodyWidth - 2)) {
-      lines.push(row(` ${line}`));
+    const contentLines = wrapTextWithAnsi(this.bodyText || this.message.content.text, bodyWidth);
+    for (const line of contentLines) {
+      const text = truncateToWidth(line, bodyWidth, "");
+      const padding = Math.max(0, bodyWidth - visibleWidth(text));
+      lines.push(this.theme.fg("accent", `│${text}${" ".repeat(padding)}│`));
     }
 
-    if (replyCommand) {
-      lines.push(row());
-      for (const line of wrapTextWithAnsi(dim(` ↩ Reply: ${replyCommand}`), bodyWidth)) {
-        lines.push(row(line));
+    if (this.replyCommand) {
+      lines.push(this.theme.fg("accent", `│${" ".repeat(bodyWidth)}│`));
+      const replyLines = wrapTextWithAnsi(this.theme.fg("dim", ` ↩ To reply: ${this.replyCommand}`), bodyWidth);
+      for (const line of replyLines) {
+        const text = truncateToWidth(line, bodyWidth, "");
+        const padding = Math.max(0, bodyWidth - visibleWidth(text));
+        lines.push(this.theme.fg("accent", `│${text}${" ".repeat(padding)}│`));
       }
     }
 
-    if (message.content.attachments?.length) {
-      lines.push(row());
-      for (const att of message.content.attachments) {
-        lines.push(row(dim(` 📎 ${att.name}`)));
+    if (this.message.content.attachments?.length) {
+      lines.push(this.theme.fg("accent", `│${" ".repeat(bodyWidth)}│`));
+      for (const att of this.message.content.attachments) {
+        const label = this.theme.fg("dim", ` 📎 ${att.name}`);
+        const text = truncateToWidth(label, bodyWidth, "");
+        const padding = Math.max(0, bodyWidth - visibleWidth(text));
+        lines.push(this.theme.fg("accent", `│${text}${" ".repeat(padding)}│`));
       }
     }
 
-    if (message.replyTo && !expectsReply) {
-      lines.push(row());
-      lines.push(row(dim(` ↳ in reply to ${message.replyTo.slice(0, 8)}`)));
+    if (this.message.replyTo && !this.message.expectsReply) {
+      lines.push(this.theme.fg("accent", `│${" ".repeat(bodyWidth)}│`));
+      const reply = this.theme.fg("dim", ` ↳ Reply to ${this.message.replyTo.slice(0, 8)}`);
+      const text = truncateToWidth(reply, bodyWidth, "");
+      const padding = Math.max(0, bodyWidth - visibleWidth(text));
+      lines.push(this.theme.fg("accent", `│${text}${" ".repeat(padding)}│`));
     }
 
-    lines.push(accent(`╰${"─".repeat(bodyWidth)}╯`));
+    lines.push(this.theme.fg("accent", `╰${borderChar.repeat(bodyWidth)}╯`));
+
     return lines;
   }
 }

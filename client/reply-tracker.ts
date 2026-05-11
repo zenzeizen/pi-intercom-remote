@@ -1,82 +1,106 @@
-/**
- * Tracks outstanding `ask` operations. The client tool layer registers an
- * expected reply with a request id and a timeout, then awaits the promise.
- * When a matching reply arrives, the tracker resolves it.
- *
- * Also tracks inbound asks (peer-originated, expecting a reply from us) so
- * the user / agent can list and answer them.
- */
-
 import type { Message, SessionInfo } from "./types.ts";
 
-export interface OutboundAskHandle {
-  requestId: string;
-  to: SessionInfo;
-  body: string;
-  startedAt: number;
-  resolve(message: Message): void;
-  reject(err: Error): void;
-  timer: NodeJS.Timeout;
-}
-
-export interface InboundAskEntry {
+/**
+ * Tracks inbound asks awaiting a reply from this session, and the
+ * intercom-context active for the current turn. Ported from pi-intercom's
+ * reply-tracker.ts with no functional changes.
+ */
+export interface IntercomContext {
   from: SessionInfo;
   message: Message;
   receivedAt: number;
 }
 
-export class ReplyTracker {
-  private readonly outbound = new Map<string, OutboundAskHandle>();
-  private readonly inbound = new Map<string, InboundAskEntry>();
-
-  registerOutbound(handle: OutboundAskHandle): void {
-    this.outbound.set(handle.requestId, handle);
-  }
-
-  /** Resolve an outbound ask. Returns true if a matching ask was waiting. */
-  resolveOutbound(requestId: string, reply: Message): boolean {
-    const handle = this.outbound.get(requestId);
-    if (!handle) return false;
-    clearTimeout(handle.timer);
-    this.outbound.delete(requestId);
-    handle.resolve(reply);
+function matchesPendingSender(context: IntercomContext, to: string): boolean {
+  if (context.from.id === to) {
     return true;
   }
+  return context.from.name?.toLowerCase() === to.toLowerCase();
+}
 
-  /** Reject all outstanding outbound asks (e.g. on disconnect). */
-  rejectAllOutbound(err: Error): void {
-    for (const handle of this.outbound.values()) {
-      clearTimeout(handle.timer);
-      handle.reject(err);
+export class ReplyTracker {
+  private readonly pendingAsks = new Map<string, IntercomContext>();
+  private readonly pendingTurnContexts: IntercomContext[] = [];
+  private currentTurnContext: IntercomContext | null = null;
+
+  constructor(private readonly askTimeoutMs = 10 * 60 * 1000) {}
+
+  recordIncomingMessage(from: SessionInfo, message: Message, receivedAt = Date.now()): IntercomContext {
+    const context = { from, message, receivedAt };
+    if (message.expectsReply) {
+      this.pendingAsks.set(message.id, context);
     }
-    this.outbound.clear();
+    return context;
   }
 
-  /** Add an inbound ask the user / agent will need to reply to. */
-  recordInbound(entry: InboundAskEntry): void {
-    this.inbound.set(entry.message.id, entry);
+  queueTurnContext(context: IntercomContext): void {
+    this.pendingTurnContexts.push(context);
   }
 
-  /** Mark an inbound ask as answered and remove it. */
-  resolveInbound(messageId: string): InboundAskEntry | undefined {
-    const entry = this.inbound.get(messageId);
-    if (entry) this.inbound.delete(messageId);
-    return entry;
+  beginTurn(now = Date.now()): void {
+    this.pruneExpired(now);
+    this.currentTurnContext = this.pendingTurnContexts.shift() ?? null;
   }
 
-  /** Drop inbound asks from a peer that left. */
-  dropInboundFrom(sessionId: string): void {
-    for (const [id, entry] of this.inbound) {
-      if (entry.from.id === sessionId) this.inbound.delete(id);
+  endTurn(): void {
+    this.currentTurnContext = null;
+  }
+
+  reset(): void {
+    this.pendingAsks.clear();
+    this.pendingTurnContexts.length = 0;
+    this.currentTurnContext = null;
+  }
+
+  resolveReplyTarget(options: { to?: string }, now = Date.now()): IntercomContext {
+    this.pruneExpired(now);
+
+    if (this.currentTurnContext) {
+      return this.currentTurnContext;
+    }
+
+    const pending = Array.from(this.pendingAsks.values());
+    if (pending.length === 1) {
+      return pending[0]!;
+    }
+
+    if (options.to) {
+      const matches = pending.filter((context) => matchesPendingSender(context, options.to!));
+      if (matches.length === 1) {
+        return matches[0]!;
+      }
+      if (matches.length > 1) {
+        throw new Error(`Multiple pending asks from "${options.to}" — use the sender session ID instead.`);
+      }
+      if (pending.length > 1) {
+        throw new Error(`No pending ask from "${options.to}"`);
+      }
+    }
+
+    if (pending.length === 0) {
+      throw new Error("No active intercom context to reply to");
+    }
+
+    throw new Error("Multiple pending asks — specify `to`");
+  }
+
+  markReplied(replyTo: string): void {
+    this.pendingAsks.delete(replyTo);
+    if (this.currentTurnContext?.message.id === replyTo) {
+      this.currentTurnContext = null;
     }
   }
 
-  listInbound(): InboundAskEntry[] {
-    return [...this.inbound.values()].sort((a, b) => a.receivedAt - b.receivedAt);
+  listPending(now = Date.now()): IntercomContext[] {
+    this.pruneExpired(now);
+    return Array.from(this.pendingAsks.values()).sort((a, b) => a.receivedAt - b.receivedAt);
   }
 
-  /** For status reporting. */
-  counts(): { outbound: number; inbound: number } {
-    return { outbound: this.outbound.size, inbound: this.inbound.size };
+  private pruneExpired(now: number): void {
+    for (const [messageId, context] of this.pendingAsks) {
+      if (now - context.receivedAt > this.askTimeoutMs) {
+        this.pendingAsks.delete(messageId);
+      }
+    }
   }
 }
