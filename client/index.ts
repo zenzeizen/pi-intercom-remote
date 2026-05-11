@@ -1,16 +1,12 @@
 /**
- * pi-relay extension entry.
+ * pi-intercom-remote extension entry.
  *
- * Ported from pi-intercom's index.ts: the same `intercom` tool surface with
- * an action parameter (list / send / ask / reply / pending / status), the
- * same idle-aware inbound queueing, the same reply-waiter pattern, the same
+ * Ported from pi-intercom's index.ts: the same `intercom` tool surface
+ * (actions list / send / ask / reply / pending / status), the same
+ * idle-aware inbound queueing, the same reply-waiter pattern, the same
  * /intercom overlay command and alt+m shortcut, the same inline message
- * renderer.
- *
- * pi-relay-only additions:
- *   - Room operations as extra tool actions (`new`, `join`, `leave`) and
- *     companion /intercom <action> shortcuts.
- *   - presence sync also pushes cwd (so peer.cwd is correct in the overlay).
+ * renderer. pi-intercom-remote adds room operations as extra tool actions
+ * (`new`, `join`, `leave`) and companion /intercom shortcuts.
  *
  * Subagent/supervisor features from pi-intercom are dropped — they are
  * orthogonal to cross-machine relaying.
@@ -165,7 +161,7 @@ export default function piRelayExtension(pi: ExtensionAPI): void {
   // --- Helpers -------------------------------------------------------
 
   function ensureConfig(): RelayConfig {
-    if (!config) throw new Error("pi-relay config not loaded yet");
+    if (!config) throw new Error("pi-intercom-remote config not loaded yet");
     return config;
   }
 
@@ -214,7 +210,7 @@ export default function piRelayExtension(pi: ExtensionAPI): void {
 
   function notifyIfLive(message: string, level: "info" | "warning" | "error" = "info"): void {
     const ctx = getLiveContext();
-    process.stderr.write(`[pi-relay ${level}] ${message}\n`);
+    process.stderr.write(`[pi-intercom-remote ${level}] ${message}\n`);
     if (!ctx?.hasUI) return;
     try {
       ctx.ui.notify(message, level);
@@ -232,7 +228,7 @@ export default function piRelayExtension(pi: ExtensionAPI): void {
   async function ensureConnected(reason: "startup" | "tool" | "command"): Promise<RelayClient> {
     if (!config) config = await loadConfig();
     if (config.enabled === false) {
-      throw new Error("pi-relay is disabled in config (set `enabled: true` to use).");
+      throw new Error("pi-intercom-remote is disabled in config (set `enabled: true` to use).");
     }
     if (client?.isConnected()) return client;
 
@@ -261,14 +257,14 @@ export default function piRelayExtension(pi: ExtensionAPI): void {
         await fresh.joinRoom(config.room);
       } catch (err) {
         notifyIfLive(
-          `pi-relay: could not rejoin room ${config.room}: ${getErrorMessage(err)}`,
+          `pi-intercom-remote: could not rejoin room ${config.room}: ${getErrorMessage(err)}`,
           "warning",
         );
       }
     }
     if (reason === "startup") {
       notifyIfLive(
-        `pi-relay connected to ${config.relayUrl}${fresh.room ? ` (room ${fresh.room})` : ""}`,
+        `pi-intercom-remote connected to ${config.relayUrl}${fresh.room ? ` (room ${fresh.room})` : ""}`,
       );
     }
     syncPresenceIdentity();
@@ -293,25 +289,25 @@ export default function piRelayExtension(pi: ExtensionAPI): void {
       handleIncomingMessage(from, message);
     });
     c.on("session_joined", (peer: SessionInfo) => {
-      notifyIfLive(`pi-relay: ${peer.name ?? shortSessionId(peer.id)} joined the room`);
+      notifyIfLive(`pi-intercom-remote: ${peer.name ?? shortSessionId(peer.id)} joined the room`);
     });
     c.on("session_left", (sessionId: string) => {
-      notifyIfLive(`pi-relay: ${shortSessionId(sessionId)} left the room`);
+      notifyIfLive(`pi-intercom-remote: ${shortSessionId(sessionId)} left the room`);
     });
     c.on("presence_update", () => {
       // Silent — overlay/list reads fresh state on demand.
     });
     c.on("disconnected", () => {
-      notifyIfLive("pi-relay disconnected; reconnecting…", "warning");
+      notifyIfLive("pi-intercom-remote disconnected; reconnecting…", "warning");
     });
     c.on("error", (err: Error) => {
-      notifyIfLive(`pi-relay error: ${err.message}`, "warning");
+      notifyIfLive(`pi-intercom-remote error: ${err.message}`, "warning");
     });
     c.on("room_changed", (ev: { room: string | null; previous: string | null }) => {
       if (ev.room) {
-        notifyIfLive(`pi-relay: room ${ev.room} active`);
+        notifyIfLive(`pi-intercom-remote: room ${ev.room} active`);
       } else if (ev.previous) {
-        notifyIfLive(`pi-relay: left room ${ev.previous}`);
+        notifyIfLive(`pi-intercom-remote: left room ${ev.previous}`);
       }
     });
   }
@@ -470,20 +466,20 @@ export default function piRelayExtension(pi: ExtensionAPI): void {
 
   async function openIntercomOverlay(ctx: ExtensionCommandContext): Promise<void> {
     if (!ctx.hasUI) {
-      notifyIfLive("pi-relay overlay only available in interactive mode", "warning");
+      notifyIfLive("pi-intercom-remote overlay only available in interactive mode", "warning");
       return;
     }
     let c: RelayClient;
     try {
       c = await ensureConnected("command");
     } catch (err) {
-      notifyIfLive(`pi-relay unavailable: ${getErrorMessage(err)}`, "error");
+      notifyIfLive(`pi-intercom-remote unavailable: ${getErrorMessage(err)}`, "error");
       return;
     }
     syncPresenceIdentity();
     if (!c.room) {
       notifyIfLive(
-        "pi-relay: not in a room. Use `/intercom new` to create one or `/intercom join <code>` to join.",
+        "pi-intercom-remote: not in a room. Use `/intercom new` to create one or `/intercom join <code>` to join.",
         "warning",
       );
       return;
@@ -518,7 +514,7 @@ export default function piRelayExtension(pi: ExtensionAPI): void {
       { overlay: true },
     );
     if (composeResult.sent) {
-      notifyIfLive(`pi-relay: message sent to ${targetLabel}`);
+      notifyIfLive(`pi-intercom-remote: message sent to ${targetLabel}`);
     }
   }
 
@@ -527,7 +523,7 @@ export default function piRelayExtension(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "intercom",
     label: "Intercom",
-    description: `Communicate with another pi session in the current pi-relay room.
+    description: `Communicate with another pi session in the current pi-intercom-remote room.
 
 Usage:
   intercom({ action: "list" })                                    → List peers in current room
@@ -540,7 +536,7 @@ Usage:
   intercom({ action: "join", to: "ABC-234" })                       → Join an existing room by code
   intercom({ action: "leave" })                                     → Leave the current room`,
     promptSnippet:
-      "Use to coordinate with another pi session across machines via pi-relay: list peers, send updates, ask for help, or check connectivity.",
+      "Use to coordinate with another pi session across machines via pi-intercom-remote: list peers, send updates, ask for help, or check connectivity.",
     parameters: Type.Object({
       action: Type.String({
         description:
@@ -576,7 +572,7 @@ Usage:
       try {
         activeClient = await ensureConnected("tool");
       } catch (err) {
-        return errorToolResult(`pi-relay not connected: ${getErrorMessage(err)}`);
+        return errorToolResult(`pi-intercom-remote not connected: ${getErrorMessage(err)}`);
       }
       syncPresenceIdentity();
 
@@ -642,7 +638,7 @@ Usage:
     const peerCount = c.isConnected() ? [...listSessionsFromClient(c)].length : 0;
     return textResult(
       [
-        c.isConnected() ? "pi-relay: connected" : "pi-relay: disconnected",
+        c.isConnected() ? "pi-intercom-remote: connected" : "pi-intercom-remote: disconnected",
         `  relay: ${cfg.relayUrl}`,
         `  session: ${c.sessionId ?? "(none)"}`,
         `  room: ${c.room ?? "(none)"}`,
@@ -658,7 +654,7 @@ Usage:
     const code = await c.createRoom();
     await updateConfig({ room: code });
     if (config) config.room = code;
-    return textResult(`pi-relay room created: ${code}. Share this code with the other pi session.`);
+    return textResult(`pi-intercom-remote room created: ${code}. Share this code with the other pi session.`);
   }
 
   async function handleJoin(c: RelayClient, to: unknown): Promise<AgentToolResult<unknown>> {
@@ -671,16 +667,16 @@ Usage:
     await c.joinRoom(to.trim());
     await updateConfig({ room: c.room ?? undefined });
     if (config) config.room = c.room ?? undefined;
-    return textResult(`Joined pi-relay room ${c.room}.`);
+    return textResult(`Joined pi-intercom-remote room ${c.room}.`);
   }
 
   function handleLeave(c: RelayClient): AgentToolResult<unknown> {
-    if (!c.room) return textResult("pi-relay: not in a room.");
+    if (!c.room) return textResult("pi-intercom-remote: not in a room.");
     const prev = c.room;
     c.leaveRoom();
     void updateConfig({ room: undefined });
     if (config) config.room = undefined;
-    return textResult(`Left pi-relay room ${prev}.`);
+    return textResult(`Left pi-intercom-remote room ${prev}.`);
   }
 
   async function handleSend(
@@ -772,7 +768,7 @@ Usage:
   // --- Slash command & shortcut -------------------------------------
 
   pi.registerCommand("intercom", {
-    description: "Open pi-relay session intercom",
+    description: "Open pi-intercom-remote session intercom",
     handler: async (args, ctx) => {
       runtimeContext = ctx;
       const tokens = args.trim().split(/\s+/).filter(Boolean);
@@ -837,7 +833,7 @@ Usage:
   }
 
   pi.registerShortcut("alt+m", {
-    description: "Open pi-relay session intercom",
+    description: "Open pi-intercom-remote session intercom",
     handler: async (ctx) => openIntercomOverlay(ctx as ExtensionCommandContext),
   });
 
@@ -867,14 +863,14 @@ Usage:
     try {
       config = await loadConfig();
     } catch (err) {
-      notifyIfLive(`pi-relay config error: ${getErrorMessage(err)}`, "error");
+      notifyIfLive(`pi-intercom-remote config error: ${getErrorMessage(err)}`, "error");
       return;
     }
     if (config.enabled === false) return;
     try {
       await ensureConnected("startup");
     } catch (err) {
-      notifyIfLive(`pi-relay could not connect: ${getErrorMessage(err)}`, "warning");
+      notifyIfLive(`pi-intercom-remote could not connect: ${getErrorMessage(err)}`, "warning");
     }
   });
 

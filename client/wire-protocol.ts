@@ -1,8 +1,8 @@
 /**
- * pi-relay wire protocol (v1) — types only.
+ * pi-intercom-remote wire protocol (v1) — types only.
  *
  * Inlined copy of the protocol types so this package is self-contained when
- * published to npm. Mirrors the canonical definitions in the pi-relay relay
+ * published to npm. Mirrors the canonical definitions in the pi-intercom-remote relay
  * (relay/) which lives in the same repository.
  *
  * Frames travel over a WebSocket; each frame is a single JSON object in one

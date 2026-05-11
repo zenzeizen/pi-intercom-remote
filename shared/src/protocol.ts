@@ -1,5 +1,5 @@
 /**
- * pi-relay wire protocol (v1).
+ * pi-intercom-remote wire protocol (v1).
  *
  * Frames travel over a WebSocket. Each frame is a single JSON object in one
  * text frame. Discriminated on `type`. The transport handles framing — no

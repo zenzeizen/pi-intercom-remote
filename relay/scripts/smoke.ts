@@ -6,7 +6,7 @@
  * peer.send (ask) → peer.send (reply) → disconnect), and asserts expected
  * frames at each step. Exits non-zero on any failure.
  *
- *   npm run smoke --workspace=@pi-relay/relay
+ *   npm run smoke --workspace=@pi-intercom-remote/relay
  */
 
 import { spawn, type ChildProcess } from "node:child_process";
@@ -18,8 +18,8 @@ import type {
   ClientMessage,
   PeerMessage,
   ServerMessage,
-} from "@pi-relay/shared";
-import { PROTOCOL_VERSION } from "@pi-relay/shared";
+} from "@pi-intercom-remote/shared";
+import { PROTOCOL_VERSION } from "@pi-intercom-remote/shared";
 
 const require = createRequire(import.meta.url);
 

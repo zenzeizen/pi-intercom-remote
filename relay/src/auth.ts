@@ -1,4 +1,4 @@
-import type { HelloMessage, SessionInfo } from "@pi-relay/shared";
+import type { HelloMessage, SessionInfo } from "@pi-intercom-remote/shared";
 
 /**
  * Pluggable auth point. Runs once per connection, right after `hello`.

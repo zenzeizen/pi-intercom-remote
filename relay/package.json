@@ -1,5 +1,5 @@
 {
-  "name": "@pi-relay/relay",
+  "name": "@pi-intercom-remote/relay",
   "version": "0.0.0",
   "private": true,
   "type": "module",
@@ -12,7 +12,7 @@
     "smoke": "tsx scripts/smoke.ts"
   },
   "dependencies": {
-    "@pi-relay/shared": "*",
+    "@pi-intercom-remote/shared": "*",
     "ws": "^8.18.0"
   },
   "devDependencies": {

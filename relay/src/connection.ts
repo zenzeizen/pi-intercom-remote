@@ -6,8 +6,8 @@ import type {
   ServerMessage,
   SessionId,
   SessionInfo,
-} from "@pi-relay/shared";
-import { PROTOCOL_VERSION } from "@pi-relay/shared";
+} from "@pi-intercom-remote/shared";
+import { PROTOCOL_VERSION } from "@pi-intercom-remote/shared";
 import type { Authenticator } from "./auth.js";
 import type { Logger } from "./logger.js";
 import type { RoomRegistry } from "./rooms.js";
@@ -97,7 +97,7 @@ export class Connection {
     }
   }
 
-  private async handleHello(msg: import("@pi-relay/shared").HelloMessage): Promise<void> {
+  private async handleHello(msg: import("@pi-intercom-remote/shared").HelloMessage): Promise<void> {
     if (msg.protocolVersion !== PROTOCOL_VERSION) {
       this.fatal(
         "protocol_unsupported_version",
@@ -164,7 +164,7 @@ export class Connection {
     }
   }
 
-  private handlePeerSend(to: SessionId, message: import("@pi-relay/shared").PeerMessage): void {
+  private handlePeerSend(to: SessionId, message: import("@pi-intercom-remote/shared").PeerMessage): void {
     const room = this.rooms.findBySession(this.sessionId);
     if (!room) {
       this.sendError("room_not_in", "join a room before sending", "peer.send");

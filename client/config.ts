@@ -1,6 +1,6 @@
 /**
  * Persistent client config: which relay to connect to, and which room (if any)
- * the user has joined. Stored at ~/.pi/agent/pi-relay/config.json — mirrors
+ * the user has joined. Stored at ~/.pi/agent/pi-intercom-remote/config.json — mirrors
  * pi-intercom's ~/.pi/agent/intercom/config.json convention.
  */
 
@@ -27,7 +27,7 @@ const DEFAULTS: RelayConfig = {
 };
 
 export function configDir(): string {
-  return path.join(homedir(), ".pi", "agent", "pi-relay");
+  return path.join(homedir(), ".pi", "agent", "pi-intercom-remote");
 }
 
 export function configPath(): string {

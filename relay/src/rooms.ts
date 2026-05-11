@@ -1,4 +1,4 @@
-import type { SessionInfo, SessionId, RoomCode } from "@pi-relay/shared";
+import type { SessionInfo, SessionId, RoomCode } from "@pi-intercom-remote/shared";
 import { generateRoomCode } from "./codes.js";
 import type { Connection } from "./connection.js";
 

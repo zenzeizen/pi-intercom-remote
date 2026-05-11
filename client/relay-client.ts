@@ -1,5 +1,5 @@
 /**
- * RelayClient — pi-relay's WebSocket client.
+ * RelayClient — pi-intercom-remote's WebSocket client.
  *
  * API mirrors pi-intercom's IntercomClient (sessionId, isConnected,
  * listSessions, send, updatePresence, disconnect, EventEmitter events:
@@ -7,11 +7,11 @@
  * `disconnected` / `error`) so the extension layer reads as a near-line
  * port of pi-intercom's index.ts.
  *
- * Adds pi-relay-only room operations (createRoom, joinRoom, leaveRoom,
- * `room_changed` event) since pi-relay groups sessions into rooms instead
+ * Adds pi-intercom-remote-only room operations (createRoom, joinRoom, leaveRoom,
+ * `room_changed` event) since pi-intercom-remote groups sessions into rooms instead
  * of pi-intercom's single global pool.
  *
- * Translates between the wire protocol (@pi-relay/shared) and the
+ * Translates between the wire protocol (@pi-intercom-remote/shared) and the
  * pi-intercom-shaped Message / SessionInfo types in ./types.ts.
  */
 
@@ -162,7 +162,7 @@ export class RelayClient extends EventEmitter {
     }
   }
 
-  // --- pi-relay-only room operations ------------------------------------
+  // --- pi-intercom-remote-only room operations ------------------------------------
 
   get room(): string | null {
     return this._room;

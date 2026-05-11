@@ -2,7 +2,7 @@
  * Client-side types. These mirror pi-intercom's `types.ts` shape so all the
  * UI components and reply tracker can be ported as near-verbatim copies.
  *
- * The wire protocol (which is independent) is defined in @pi-relay/shared.
+ * The wire protocol (which is independent) is defined in @pi-intercom-remote/shared.
  * Translation between wire SessionInfo and this SessionInfo happens at the
  * RelayClient boundary.
  */

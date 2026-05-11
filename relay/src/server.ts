@@ -1,5 +1,5 @@
 import { WebSocketServer } from "ws";
-import { loadConfig } from "./config.js";
+import { classifyHost, loadConfig, type RelayConfig } from "./config.js";
 import { ConsoleLogger } from "./logger.js";
 import { AllowAllAuthenticator } from "./auth.js";
 import { RoomRegistry } from "./rooms.js";
@@ -11,8 +11,41 @@ import { Connection } from "./connection.js";
  * so embedders can override one behavior without diverging the whole file.
  */
 
+function printExposureWarning(config: RelayConfig): void {
+  const exposure = classifyHost(config.host);
+  if (exposure === "loopback" || exposure === "tailscale") return;
+
+  const lines: string[] = ["", "=".repeat(72)];
+  if (exposure === "wildcard") {
+    lines.push(
+      `⚠  pi-intercom-remote binding to ${config.host}:${config.port} — every network interface.`,
+      "",
+      "   v1 has no per-room authentication and no end-to-end encryption.",
+      "   Anyone who can reach this socket can join any room whose code they",
+      "   know. Do NOT run this on a machine reachable from the public internet.",
+      "",
+      "   Recommended: bind to a VPN interface instead (Tailscale, WireGuard,",
+      "   ZeroTier) by setting PI_RELAY_HOST to that interface's IP.",
+    );
+  } else {
+    lines.push(
+      `⚠  pi-intercom-remote binding to ${config.host}:${config.port} — not loopback or a Tailscale-range IP.`,
+      "",
+      "   v1 has no per-room authentication. Anyone who can reach this address",
+      `   on port ${config.port} can join any room whose code they know.`,
+      "",
+      "   Make sure this interface is only reachable from machines you trust:",
+      "   a VPN tunnel (Tailscale, WireGuard, ZeroTier), a private LAN you",
+      "   control, or behind a tunnel with bearer-token auth in front.",
+    );
+  }
+  lines.push("=".repeat(72), "");
+  process.stderr.write(lines.join("\n") + "\n");
+}
+
 function main(): void {
   const config = loadConfig();
+  printExposureWarning(config);
   const log = new ConsoleLogger();
   const rooms = new RoomRegistry();
   const auth = new AllowAllAuthenticator();

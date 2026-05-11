@@ -6,11 +6,19 @@ Where pi-intercom is a local broker (Unix socket / named pipe) for same-machine 
 
 ## Install
 
+From a local checkout of the pi-intercom-remote repository:
+
+```sh
+pi -e /path/to/pi-intercom-remote/client
+```
+
+When published to npm:
+
 ```sh
 pi install npm:pi-intercom-remote
 ```
 
-Then start the relay (see *Running a relay* below) and run pi as usual. The extension auto-connects to `ws://127.0.0.1:8787` by default.
+Either install path produces the same extension. You also need a running relay — see *Running a relay* below. The extension auto-connects to `ws://127.0.0.1:8787` by default; override via `~/.pi/agent/pi-intercom-remote/config.json`.
 
 ## Usage
 
@@ -47,7 +55,7 @@ User commands and shortcuts:
 
 ## Configuration
 
-`~/.pi/agent/pi-relay/config.json`:
+`~/.pi/agent/pi-intercom-remote/config.json`:
 
 ```json
 {
@@ -60,15 +68,15 @@ User commands and shortcuts:
 - `room` — currently joined room code. Set automatically by `/intercom new` / `/intercom join`.
 - `enabled` — set `false` to keep the extension installed but skip auto-connect.
 - `displayName` — optional override for the name shown to peers.
-- `authCredential` — optional bearer credential sent in the `hello` frame. Reserved for future use.
+- `authCredential` — optional bearer credential sent in the `hello` frame. Reserved for non-default authenticators.
 
 ## Running a relay
 
-The relay server is a small WebSocket service (~250 lines of Node + ws). Source and build instructions live alongside this extension in the pi-relay source repository. The default bind is `127.0.0.1` only; set `PI_RELAY_HOST` to a LAN IP, a Tailscale interface, or `0.0.0.0` to make it reachable from other machines.
+The relay server is a small WebSocket service (~250 lines of Node + `ws`). Source and build instructions live alongside this extension in the pi-intercom-remote source repository. The default bind is `127.0.0.1` only; set `PI_RELAY_HOST` to a LAN IP, a Tailscale interface, or `0.0.0.0` to make it reachable from other machines.
 
 ## Status
 
-Early — v0.1. Wire protocol is versioned and stable across patch releases. Auth is currently transport-level (TLS) only; per-room secrets and end-to-end encryption are deferred to a later version.
+v0.1. Wire protocol is versioned and stable across patch releases. Auth is currently transport-level (TLS, VPN, loopback) only; per-room secrets and end-to-end encryption are deferred to a later version.
 
 ## Relation to pi-intercom
 
@@ -76,4 +84,4 @@ The tool surface, idle-aware inbound queueing, reply-waiter pattern, UI overlays
 
 ## License
 
-MIT — see `LICENSE` in the source repository.
+MIT — see `LICENSE`.
