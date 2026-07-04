@@ -37,6 +37,7 @@ Room operations (pi-intercom-remote-only — pi-intercom has no rooms):
 
 ```js
 intercom({ action: "new" })                  // create a fresh room (returns a code like ABC-234)
+intercom({ action: "new", to: "AMBER-HQ" })  // get-or-create a standing room with a fixed code
 intercom({ action: "join", to: "ABC-234" })  // join an existing room by code
 intercom({ action: "leave" })                // leave the current room
 ```

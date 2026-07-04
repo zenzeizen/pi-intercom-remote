@@ -19,6 +19,7 @@ There is one tool, `intercom`, with an `action` parameter:
 Room operations:
 
 - `intercom({ action: "new" })` — create a fresh room; returns a code like `ABC-234`.
+- `intercom({ action: "new", to: "AMBER-HQ" })` — get-or-create a **standing room** with a fixed code. If it already exists, you join it; if the relay garbage-collected it while empty, it's recreated with the identical code. Use this for a permanent room shared across specific machines instead of re-pairing every session.
 - `intercom({ action: "join", to: "ABC-234" })` — join an existing room by code.
 - `intercom({ action: "leave" })` — leave the current room.
 

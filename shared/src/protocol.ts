@@ -69,6 +69,13 @@ export interface HelloMessage {
 
 export interface RoomCreateMessage {
   type: "room.create";
+  /**
+   * Optional explicit room code for "standing room" use — get-or-create
+   * semantics. If a room with this code already exists, the caller joins it
+   * (server replies room.joined instead of room.created). If omitted, the
+   * server generates a random code as before.
+   */
+  code?: RoomCode;
 }
 
 export interface RoomJoinMessage {

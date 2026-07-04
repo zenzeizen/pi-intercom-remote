@@ -256,10 +256,18 @@ export default function piRelayExtension(pi: ExtensionAPI): void {
       try {
         await fresh.joinRoom(config.room);
       } catch (err) {
-        notifyIfLive(
-          `pi-intercom-remote: could not rejoin room ${config.room}: ${getErrorMessage(err)}`,
-          "warning",
-        );
+        // Standing room may have been garbage-collected while empty (relay
+        // deletes rooms with zero members). Recreate it with the same fixed
+        // code — get-or-create semantics mean this is a no-op if it still
+        // exists, or lands us in a fresh room with the identical code.
+        try {
+          await fresh.createRoom(config.room);
+        } catch (recreateErr) {
+          notifyIfLive(
+            `pi-intercom-remote: could not rejoin/recreate room ${config.room}: ${getErrorMessage(recreateErr)}`,
+            "warning",
+          );
+        }
       }
     }
     if (reason === "startup") {
@@ -533,6 +541,7 @@ Usage:
   intercom({ action: "pending" })                                   → List unresolved inbound asks
   intercom({ action: "status" })                                    → Show connection / room status
   intercom({ action: "new" })                                       → Create a new room (returns code)
+  intercom({ action: "new", to: "AMBER-HQ" })                        → Get-or-create a standing room with a fixed code (survives empty-room GC)
   intercom({ action: "join", to: "ABC-234" })                       → Join an existing room by code
   intercom({ action: "leave" })                                     → Leave the current room`,
     promptSnippet:
@@ -587,7 +596,7 @@ Usage:
           case "status":
             return handleStatus(activeClient);
           case "new":
-            return await handleNew(activeClient);
+            return await handleNew(activeClient, typeof params.to === "string" ? params.to : undefined);
           case "join":
             return await handleJoin(activeClient, params.to);
           case "leave":
@@ -647,14 +656,18 @@ Usage:
     );
   }
 
-  async function handleNew(c: RelayClient): Promise<AgentToolResult<unknown>> {
+  async function handleNew(c: RelayClient, requestedCode?: string): Promise<AgentToolResult<unknown>> {
     if (c.room) {
       return errorToolResult(`Already in room ${c.room}. Leave first with intercom({ action: "leave" }).`);
     }
-    const code = await c.createRoom();
+    const code = await c.createRoom(requestedCode);
     await updateConfig({ room: code });
     if (config) config.room = code;
-    return textResult(`pi-intercom-remote room created: ${code}. Share this code with the other pi session.`);
+    return textResult(
+      requestedCode
+        ? `pi-intercom-remote standing room ready: ${code}.`
+        : `pi-intercom-remote room created: ${code}. Share this code with the other pi session.`,
+    );
   }
 
   async function handleJoin(c: RelayClient, to: unknown): Promise<AgentToolResult<unknown>> {
@@ -784,7 +797,7 @@ Usage:
       try {
         const c = await ensureConnected("command");
         if (sub === "new") {
-          const result = await handleNew(c);
+          const result = await handleNew(c, tokens[1]);
           notifyIfLive(textOf(result));
           return;
         }

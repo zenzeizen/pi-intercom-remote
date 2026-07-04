@@ -72,7 +72,7 @@ export class Connection {
         await this.handleHello(msg);
         return;
       case "room.create":
-        this.handleRoomCreate();
+        this.handleRoomCreate(msg.code);
         return;
       case "room.join":
         this.handleRoomJoin(msg.code);
@@ -117,14 +117,35 @@ export class Connection {
     this.log.log("info", "session.ready", { sessionId: this.sessionId, name: this.info.name });
   }
 
-  private handleRoomCreate(): void {
+  private handleRoomCreate(rawCode?: string): void {
     if (this.rooms.findBySession(this.sessionId)) {
       this.sendError("room_already_in", "session already in a room", "room.create");
       return;
     }
-    const room = this.rooms.createRoom(this);
-    this.send({ type: "room.created", code: room.code, peers: this.rooms.peerInfos(room) });
-    this.log.log("info", "room.created", { sessionId: this.sessionId, code: room.code });
+    if (!rawCode) {
+      const room = this.rooms.createRoom(this);
+      this.send({ type: "room.created", code: room.code, peers: this.rooms.peerInfos(room) });
+      this.log.log("info", "room.created", { sessionId: this.sessionId, code: room.code });
+      return;
+    }
+    // Explicit code: get-or-create "standing room" semantics.
+    const { room, created } = this.rooms.getOrCreateRoom(this, rawCode);
+    if (created) {
+      this.send({ type: "room.created", code: room.code, peers: this.rooms.peerInfos(room) });
+      this.log.log("info", "room.created", { sessionId: this.sessionId, code: room.code });
+      return;
+    }
+    const peers = this.rooms.peerInfos(room);
+    this.send({ type: "room.joined", code: room.code, peers });
+    for (const member of room.members.values()) {
+      if (member.sessionId === this.sessionId) continue;
+      member.send({ type: "room.peer-joined", peer: this.info });
+    }
+    this.log.log("info", "room.joined-via-create", {
+      sessionId: this.sessionId,
+      code: room.code,
+      peerCount: room.members.size,
+    });
   }
 
   private handleRoomJoin(rawCode: string): void {

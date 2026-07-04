@@ -58,6 +58,8 @@ export interface HelloMessage {
 
 export interface RoomCreateMessage {
   type: "room.create";
+  /** Optional explicit room code for "standing room" get-or-create semantics. */
+  code?: RoomCode;
 }
 
 export interface RoomJoinMessage {

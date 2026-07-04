@@ -1,5 +1,5 @@
 import type { SessionInfo, SessionId, RoomCode } from "@pi-intercom-remote/shared";
-import { generateRoomCode } from "./codes.js";
+import { generateRoomCode, normalizeRoomCode } from "./codes.js";
 import type { Connection } from "./connection.js";
 
 /**
@@ -41,6 +41,26 @@ export class RoomRegistry {
   /** Look up a room by code. */
   findByCode(code: RoomCode): Room | undefined {
     return this.byCode.get(code);
+  }
+
+  /**
+   * Get-or-create semantics for a "standing room" with an explicit code.
+   * If a room with this code exists, `conn` joins it (caller must ensure not
+   * already in a room). If not, a fresh room is created using exactly this
+   * code (no random generation) so reconnecting sessions always land in the
+   * same place even after the room went empty and was garbage-collected.
+   */
+  getOrCreateRoom(conn: Connection, rawCode: RoomCode): { room: Room; created: boolean } {
+    const code = normalizeRoomCode(rawCode);
+    const existing = this.byCode.get(code);
+    if (existing) {
+      this.addToRoom(existing, conn);
+      return { room: existing, created: false };
+    }
+    const room: Room = { code, members: new Map([[conn.sessionId, conn]]) };
+    this.byCode.set(code, room);
+    this.bySession.set(conn.sessionId, room);
+    return { room, created: true };
   }
 
   /** Look up the room a session is in, if any. */

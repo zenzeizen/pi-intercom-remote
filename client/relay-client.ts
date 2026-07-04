@@ -168,12 +168,12 @@ export class RelayClient extends EventEmitter {
     return this._room;
   }
 
-  async createRoom(): Promise<string> {
+  async createRoom(code?: string): Promise<string> {
     if (!this.isConnected()) throw new Error("Not connected");
     if (this.roomOpPending) throw new Error("Another room operation is in flight");
     return new Promise<string>((resolve, reject) => {
       this.roomOpPending = { kind: "create", resolve, reject };
-      this.sendWire({ type: "room.create" });
+      this.sendWire(code ? { type: "room.create", code } : { type: "room.create" });
     });
   }
 

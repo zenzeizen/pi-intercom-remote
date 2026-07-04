@@ -223,6 +223,50 @@ async function main(): Promise<void> {
     console.log("✓ disconnect → room.peer-left");
 
     a.close();
+
+    // Standing room: explicit code get-or-create, survives empty-room GC ---
+    const STANDING_CODE = "AMB-777";
+    const c = new Client("C");
+    const d = new Client("D");
+    await Promise.all([c.open(), d.open()]);
+    c.send({ type: "hello", protocolVersion: PROTOCOL_VERSION, info: { name: "agent-C" } });
+    d.send({ type: "hello", protocolVersion: PROTOCOL_VERSION, info: { name: "agent-D" } });
+    const cWelcome = await c.waitFor("welcome");
+    const dWelcome = await d.waitFor("welcome");
+
+    // First caller with an explicit code creates the room using exactly that code.
+    c.send({ type: "room.create", code: STANDING_CODE });
+    const cCreated = await c.waitFor("room.created");
+    assert(cCreated.code === STANDING_CODE, `standing room uses requested code: ${cCreated.code}`);
+    console.log(`✓ room.create (explicit code) → ${cCreated.code}`);
+
+    // A second caller hitting room.create with the same code joins instead of
+    // erroring — get-or-create semantics.
+    d.send({ type: "room.create", code: STANDING_CODE });
+    const dJoined = await d.waitFor("room.joined");
+    assert(dJoined.code === STANDING_CODE, "second room.create with same code joins existing room");
+    assert(dJoined.peers.length === 2, "D sees 2 peers after joining via create");
+    await c.waitFor("room.peer-joined");
+    console.log("✓ room.create (explicit code, room exists) → joins instead of erroring");
+
+    // Both leave — relay GCs the empty room and releases the code.
+    c.close();
+    await d.waitFor("room.peer-left");
+    d.close();
+    await delay(100);
+
+    // Reconnecting with the same explicit code recreates the room fresh,
+    // with the identical code — this is the client's rejoin-fallback path.
+    const e = new Client("E");
+    await e.open();
+    e.send({ type: "hello", protocolVersion: PROTOCOL_VERSION, info: { name: "agent-E" } });
+    await e.waitFor("welcome");
+    e.send({ type: "room.create", code: STANDING_CODE });
+    const eCreated = await e.waitFor("room.created");
+    assert(eCreated.code === STANDING_CODE, "standing room survives empty-room GC via recreate-with-same-code");
+    console.log("✓ standing room: recreated with identical code after GC");
+    e.close();
+
     console.log("\nALL SMOKE CHECKS PASSED");
   } catch (err) {
     console.error("SMOKE TEST FAILED:", err);

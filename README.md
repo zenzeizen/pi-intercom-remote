@@ -41,6 +41,16 @@ pi -e ./client
 
 In one pi session, run `/intercom new` — it prints a room code (e.g. `ABC-234`). In the other, run `/intercom join ABC-234`. Both sessions can now `send` / `ask` / `reply` from their tool surface, or use `alt+m` for the picker overlay.
 
+### Standing rooms (fixed code, survives restarts)
+
+By default `room.create` generates a random code, and the relay deletes a room the moment it empties out — every session restart means re-pairing with a fresh code. For a permanent 3+-machine room, pass an explicit code instead:
+
+```js
+intercom({ action: "new", to: "AMBER-HQ" })   // or: /intercom new AMBER-HQ
+```
+
+This is get-or-create: the first caller creates a room with exactly that code; every later caller (even after the room went empty and was garbage-collected) lands back in a room with the identical code. Every peer's `~/.pi/agent/pi-intercom-remote/config.json` should set `"room": "AMBER-HQ"` — on session start the client automatically retries `room.create` with that code if the plain rejoin (`room.join`) fails because the room was GC'd, so the room code never has to be re-shared by hand.
+
 ## Two machines on the same network
 
 The relay binds to `127.0.0.1` by default. To accept connections from other machines, point it at a routable interface with `PI_RELAY_HOST`:
