@@ -11,6 +11,7 @@ There is one tool, `intercom`, with an `action` parameter:
 
 - `intercom({ action: "list" })` — list peers in the current room.
 - `intercom({ action: "send", to: "<session-id>", message: "..." })` — fire-and-forget message to a peer. Use for status updates, hand-offs, anything that doesn't need a structured response.
+- `intercom({ action: "send", to: "all", message: "..." })` — broadcast to every other peer currently in the room (also accepts `*`, `everyone`, `room`). Reports per-peer delivery status.
 - `intercom({ action: "ask",  to: "<session-id>", message: "..." })` — send a question and **block** until the peer replies (10-minute timeout). Use when you need an answer before continuing.
 - `intercom({ action: "reply", message: "..." })` — answer the active or single pending ask directed at you. Pass `to: "<sender>"` only to disambiguate when multiple are pending.
 - `intercom({ action: "pending" })` — list asks from peers that you have not yet replied to.

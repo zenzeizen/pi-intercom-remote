@@ -536,6 +536,7 @@ export default function piRelayExtension(pi: ExtensionAPI): void {
 Usage:
   intercom({ action: "list" })                                    → List peers in current room
   intercom({ action: "send", to: "session-id", message: "..." })  → Fire-and-forget message
+  intercom({ action: "send", to: "all", message: "..." })          → Broadcast to every other peer in the room
   intercom({ action: "ask",  to: "session-id", message: "..." })  → Ask and wait for reply
   intercom({ action: "reply", message: "..." })                    → Reply to the active/single pending ask
   intercom({ action: "pending" })                                   → List unresolved inbound asks
@@ -692,6 +693,36 @@ Usage:
     return textResult(`Left pi-intercom-remote room ${prev}.`);
   }
 
+  const BROADCAST_TARGETS = new Set(["all", "*", "everyone", "room"]);
+
+  async function handleBroadcast(
+    c: RelayClient,
+    params: { message?: string; attachments?: Attachment[]; replyTo?: string },
+  ): Promise<AgentToolResult<unknown>> {
+    if (!params.message || !params.message.trim()) return errorToolResult("Missing `message` for send.");
+    const peers = [...listSessionsFromClient(c)].filter((s) => s.id !== c.sessionId);
+    if (peers.length === 0) return textResult("No other peers in the room to broadcast to.");
+    const results = await Promise.allSettled(
+      peers.map((peer) =>
+        c.send(peer.id, {
+          text: params.message!,
+          attachments: params.attachments,
+          replyTo: params.replyTo,
+        }),
+      ),
+    );
+    const lines = results.map((r, i) => {
+      const peer = peers[i]!;
+      if (r.status === "fulfilled" && r.value.delivered) return `✓ ${peer.name ?? peer.id}`;
+      const reason = r.status === "fulfilled" ? r.value.reason ?? "unknown reason" : getErrorMessage(r.reason);
+      return `✗ ${peer.name ?? peer.id}: ${reason}`;
+    });
+    const okCount = lines.filter((l) => l.startsWith("✓")).length;
+    return textResult(
+      `Broadcast to ${okCount}/${peers.length} peer${peers.length === 1 ? "" : "s"}:\n${lines.join("\n")}`,
+    );
+  }
+
   async function handleSend(
     c: RelayClient,
     params: { to?: string; message?: string; attachments?: Attachment[]; replyTo?: string },
@@ -699,6 +730,9 @@ Usage:
   ): Promise<AgentToolResult<unknown>> {
     if (!params.to) return errorToolResult("Missing `to` for send.");
     if (!params.message || !params.message.trim()) return errorToolResult("Missing `message` for send.");
+    if (BROADCAST_TARGETS.has(params.to.trim().toLowerCase())) {
+      return handleBroadcast(c, params);
+    }
     const resolved = resolveSessionByQuery([...listSessionsFromClient(c)], params.to, {
       excludeSelf: c.sessionId ?? undefined,
     });

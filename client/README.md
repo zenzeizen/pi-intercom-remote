@@ -27,6 +27,7 @@ Same tool surface as pi-intercom — a single `intercom` tool with an `action` p
 ```js
 intercom({ action: "list" })                                      // list peers in current room
 intercom({ action: "send",  to: "<session-id>", message: "..." }) // fire-and-forget
+intercom({ action: "send",  to: "all", message: "..." })           // broadcast to every other peer in the room
 intercom({ action: "ask",   to: "<session-id>", message: "..." }) // ask + wait for reply
 intercom({ action: "reply", message: "..." })                     // reply to the active/single pending ask
 intercom({ action: "pending" })                                   // list unresolved inbound asks
