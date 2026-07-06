@@ -296,11 +296,11 @@ export default function piRelayExtension(pi: ExtensionAPI): void {
     c.on("message", (from: SessionInfo, message: Message) => {
       handleIncomingMessage(from, message);
     });
-    c.on("session_joined", (peer: SessionInfo) => {
-      notifyIfLive(`pi-intercom-remote: ${peer.name ?? shortSessionId(peer.id)} joined the room`);
+    c.on("session_joined", () => {
+      // Silent — peer churn is noise; overlay/list reads fresh state on demand.
     });
-    c.on("session_left", (sessionId: string) => {
-      notifyIfLive(`pi-intercom-remote: ${shortSessionId(sessionId)} left the room`);
+    c.on("session_left", () => {
+      // Silent — peer churn is noise; overlay/list reads fresh state on demand.
     });
     c.on("presence_update", () => {
       // Silent — overlay/list reads fresh state on demand.
