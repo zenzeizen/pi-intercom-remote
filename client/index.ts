@@ -763,6 +763,11 @@ Usage:
     signal: AbortSignal | undefined,
   ): Promise<AgentToolResult<unknown>> {
     if (!params.to) return errorToolResult("Missing `to` for ask.");
+    if (BROADCAST_TARGETS.has(params.to.trim().toLowerCase())) {
+      return errorToolResult(
+        'Broadcast ask is not supported — an ask blocks on a single reply and would solicit N peers at once. Target a specific session id, or use send to: "all" for room-wide info.',
+      );
+    }
     if (!params.message || !params.message.trim()) return errorToolResult("Missing `message` for ask.");
     if (replyWaiter) return errorToolResult("Already waiting for a reply to a previous ask.");
     const resolved = resolveSessionByQuery([...listSessionsFromClient(c)], params.to, {
