@@ -50,6 +50,14 @@ If the user hasn't joined a room yet, suggest the slash commands:
 
 When `intercom({ action: "pending" })` returns asks directed at you, prioritize replying to the oldest first unless the user says otherwise. `intercom({ action: "reply", message: "..." })` targets the active turn's ask (or the single pending one) automatically — pass `to: "<sender id or name>"` only when multiple are pending and you need to disambiguate.
 
+## Broadcast etiquette
+
+**Sending:** prefer a targeted `send`/`ask` to a specific session id whenever you know who the message concerns. Broadcast (`to: "all"`) is for genuinely room-wide information (outage notices, convention changes, "who owns X?" discovery). Every broadcast is automatically prefixed with a disclaimer telling uninvolved peers to stay silent — write the body assuming most receivers should ignore it, and NAME the peers/machines/work it actually concerns.
+
+**Receiving a broadcast:** a broadcast is fan-out, not an assignment. If it doesn't name you, your machine, or your current work — the correct response is silence: no reply, no ack, no action (this prevents N-peer ack-spam and duplicated work). If it does concern you directly, replying or acknowledging is fine. Either way, do NOT start substantive work from a broadcast without your own operator's explicit go-ahead.
+
+**Receiving a targeted message:** someone chose your session specifically — replying is appropriate. Substantive work still needs your operator's go unless it's unambiguously within what you're already doing.
+
 ## Reading inbound messages
 
 Incoming peer messages appear inline in the transcript with a bordered box (📨). They are already in your context — you don't need to call a tool to re-read them. Use `intercom({ action: "list" })` to refresh the peer list and `intercom({ action: "pending" })` to refresh unanswered asks on demand.
