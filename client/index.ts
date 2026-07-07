@@ -33,6 +33,25 @@ const INBOUND_FLUSH_DELAY_MS = 200;
 const INBOUND_IDLE_RETRY_MS = 500;
 const ASK_TIMEOUT_MS = 10 * 60 * 1000;
 const DEFAULT_PRESENCE_NAME = "pi-agent";
+
+// Reload-survival for ReplyTracker.pendingAsks: `/reload` tears down and
+// rebinds a fresh extension module instance, wiping the in-memory Map
+// (see docs/extensions.md § ctx.reload() — "must not assume old in-memory
+// extension state is still valid"). We persist ask lifecycle events via
+// pi.appendEntry (session-scoped, not LLM-context-visible) and replay them
+// in session_start to rehydrate pendingAsks before anything can query it.
+const PENDING_ASK_ENTRY_TYPE = "pi_intercom_pending_ask";
+const ASK_RESOLVED_ENTRY_TYPE = "pi_intercom_ask_resolved";
+
+interface PendingAskEntryData {
+  from: SessionInfo;
+  message: Message;
+  receivedAt: number;
+}
+
+interface AskResolvedEntryData {
+  messageId: string;
+}
 const NON_INTERACTIVE_BUSY_REPLY =
   "This agent is running in non-interactive mode and cannot respond to intercom messages while it is working. It will continue its current task and exit when done.";
 
@@ -420,6 +439,31 @@ export default function piRelayExtension(pi: ExtensionAPI): void {
     scheduleInboundFlush();
   }
 
+  // Rehydrate ReplyTracker.pendingAsks from persisted session entries.
+  // `/reload` (and session new/resume/fork) rebinds a fresh extension module,
+  // silently discarding the previous in-memory Map — without this, an ask
+  // recorded before reload becomes permanently unmatchable even though it's
+  // still visible in the transcript. A fresh module instance means an
+  // already-populated tracker isn't expected here, but reset() first makes
+  // the rebuild idempotent regardless.
+  function restorePendingAsks(ctx: ExtensionContext): void {
+    replyTracker.reset();
+    const candidates = new Map<string, PendingAskEntryData>();
+    for (const raw of ctx.sessionManager.getEntries()) {
+      if (raw.type !== "custom") continue;
+      if (raw.customType === PENDING_ASK_ENTRY_TYPE) {
+        const data = raw.data as PendingAskEntryData | undefined;
+        if (data?.message?.id) candidates.set(data.message.id, data);
+      } else if (raw.customType === ASK_RESOLVED_ENTRY_TYPE) {
+        const data = raw.data as AskResolvedEntryData | undefined;
+        if (data?.messageId) candidates.delete(data.messageId);
+      }
+    }
+    for (const { from, message, receivedAt } of candidates.values()) {
+      replyTracker.recordIncomingMessage(from, message, receivedAt);
+    }
+  }
+
   function handleIncomingMessage(from: SessionInfo, message: Message): void {
     const ctx = getLiveContext();
     if (!ctx) return;
@@ -432,7 +476,11 @@ export default function piRelayExtension(pi: ExtensionAPI): void {
     const replyCommand = message.expectsReply
       ? `intercom({ action: "reply", message: "..." })`
       : undefined;
-    replyTracker.recordIncomingMessage(from, message);
+    const receivedAt = Date.now();
+    replyTracker.recordIncomingMessage(from, message, receivedAt);
+    if (message.expectsReply) {
+      pi.appendEntry<PendingAskEntryData>(PENDING_ASK_ENTRY_TYPE, { from, message, receivedAt });
+    }
     const entry: InboundMessageEntry = { from, message, bodyText, ...(replyCommand ? { replyCommand } : {}) };
 
     void (async () => {
@@ -456,6 +504,7 @@ export default function piRelayExtension(pi: ExtensionAPI): void {
               });
               if (result.delivered && getLiveContext()) {
                 replyTracker.markReplied(message.id);
+                pi.appendEntry<AskResolvedEntryData>(ASK_RESOLVED_ENTRY_TYPE, { messageId: message.id });
               }
             } catch {
               // Best-effort — keep the busy non-interactive session running either way.
@@ -815,6 +864,7 @@ Usage:
       return errorToolResult(`Reply not delivered: ${result.reason ?? "unknown reason"}`);
     }
     replyTracker.markReplied(context.message.id);
+    pi.appendEntry<AskResolvedEntryData>(ASK_RESOLVED_ENTRY_TYPE, { messageId: context.message.id });
     return textResult(`Replied to ${context.from.name ?? context.from.id}.`);
   }
 
@@ -928,6 +978,7 @@ Usage:
       return;
     }
     if (config.enabled === false) return;
+    restorePendingAsks(ctx);
     try {
       await ensureConnected("startup");
     } catch (err) {
